@@ -7,28 +7,48 @@ Based on: https://gist.github.com/josephjacks/32a4b1db0c191dff26687b6b5da1f984
 Simplified for single subnet stake/unstake operations
 
 Usage:
-    python3 stake_simple.py
+    Interactive mode: python3 stake_bot.py
+    PM2 mode: pm2 start ecosystem.config.js
 
-The script will prompt for your wallet password interactively.
+The script can work in two modes:
+1. Interactive: Prompts for configuration
+2. Environment variables: Uses environment variables (for PM2)
 """
 
 import bittensor as bt
 import time
 import sys
+import os
 
 def main():
     print("=" * 70)
     print("Bittensor Simple Stake Bot")
     print("=" * 70)
     
-    # Configuration - edit these values
-    WALLET_NAME = input("Enter wallet name [default]: ").strip() or "default"
-    HOTKEY_NAME = input("Enter hotkey name [default]: ").strip() or "default"
-    VALIDATOR_HOTKEY = input("Enter validator hotkey (SS58 address): ").strip()
-    STAKE_AMOUNT = float(input("Enter stake amount in TAO [0.001]: ").strip() or "0.001")
-    NETUID = int(input("Enter subnet ID [1]: ").strip() or "1")
-    NETWORK = input("Enter network (test/finney) [test]: ").strip() or "test"
-    CONTINUOUS = input("Run continuously? (y/n) [n]: ").strip().lower() == 'y'
+    # Check if running in environment mode (PM2) or interactive mode
+    use_env = os.getenv('VALIDATOR_HOTKEY') is not None
+    
+    # Configuration
+    if use_env:
+        print("\nRunning in ENVIRONMENT MODE (PM2)")
+        WALLET_NAME = os.getenv('WALLET_NAME', 'default')
+        HOTKEY_NAME = os.getenv('HOTKEY_NAME', 'default')
+        VALIDATOR_HOTKEY = os.getenv('VALIDATOR_HOTKEY', '')
+        STAKE_AMOUNT = float(os.getenv('STAKE_AMOUNT', '0.001'))
+        NETUID = int(os.getenv('NETUID', '1'))
+        NETWORK = os.getenv('NETWORK', 'test')
+        CONTINUOUS = os.getenv('CONTINUOUS', 'false').lower() in ['true', 'yes', '1', 'y']
+        WALLET_PASSWORD = os.getenv('WALLET_PASSWORD')
+    else:
+        print("\nRunning in INTERACTIVE MODE")
+        WALLET_NAME = input("Enter wallet name [default]: ").strip() or "default"
+        HOTKEY_NAME = input("Enter hotkey name [default]: ").strip() or "default"
+        VALIDATOR_HOTKEY = input("Enter validator hotkey (SS58 address): ").strip()
+        STAKE_AMOUNT = float(input("Enter stake amount in TAO [0.001]: ").strip() or "0.001")
+        NETUID = int(input("Enter subnet ID [1]: ").strip() or "1")
+        NETWORK = input("Enter network (test/finney) [test]: ").strip() or "test"
+        CONTINUOUS = input("Run continuously? (y/n) [n]: ").strip().lower() == 'y'
+        WALLET_PASSWORD = None
     
     if not VALIDATOR_HOTKEY:
         print("ERROR: Validator hotkey is required!")
@@ -50,9 +70,14 @@ def main():
     wallet = bt.wallet(name=WALLET_NAME, hotkey=HOTKEY_NAME)
     wallet.create_if_non_existent()
     
-    # Unlock coldkey - will prompt for password
-    print("\nUnlocking wallet (you will be prompted for password)...")
-    wallet.unlock_coldkey()
+    # Unlock coldkey
+    print("\nUnlocking wallet...")
+    if WALLET_PASSWORD:
+        # Use password from environment variable (PM2 mode)
+        wallet.unlock_coldkey(password=WALLET_PASSWORD)
+    else:
+        # Prompt for password (interactive mode)
+        wallet.unlock_coldkey()
     print("✓ Wallet unlocked")
     
     # Connect to network
