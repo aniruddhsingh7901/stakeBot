@@ -2,9 +2,8 @@
 
 Simple script to automatically stake and unstake TAO on Bittensor subnets, block-by-block.
 
-> **🚀 New to PM2?** Check out [QUICKSTART.md](QUICKSTART.md) for step-by-step instructions!
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Interactive Mode (CLI)
 
@@ -58,11 +57,11 @@ pm2 startup
 pm2 save
 ```
 
-**⚠️ IMPORTANT:** You MUST edit `ecosystem.config.js` before starting the bot! At minimum, set:
+**IMPORTANT:** You MUST edit `ecosystem.config.js` before starting the bot! At minimum, set:
 - `VALIDATOR_HOTKEY` - Your validator's SS58 address
 - `WALLET_PASSWORD` - Your wallet password
 
-## ⚙️ Configuration
+## Configuration
 
 ### Interactive Mode
 
@@ -100,7 +99,7 @@ env: {
 4. Save the file
 5. Then run: `pm2 start ecosystem.config.js`
 
-**⚠️ Required Fields:**
+**Required Fields:**
 - `VALIDATOR_HOTKEY` - Must be a valid SS58 address
 - `WALLET_PASSWORD` - Your wallet password (or leave empty and use keyfile)
 
@@ -109,14 +108,14 @@ env: {
 - Environment variables set at system level
 - PM2 secrets management
 
-## 📋 Requirements
+## Requirements
 
 - Python 3.8+
 - Bittensor SDK
 - Configured Bittensor wallet with TAO balance
 - PM2 (optional, for background process)
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 stake/
@@ -127,7 +126,7 @@ stake/
 └── README.md
 ```
 
-## ⚙️ How It Works
+## How It Works
 
 The bot automatically:
 
@@ -152,7 +151,7 @@ Block N+1:   Unstake 0.001 TAO
 Repeat...
 ```
 
-## 💡 Example Usage
+## Example Usage
 
 ### Single Cycle (Test)
 
@@ -206,7 +205,7 @@ pm2 start ecosystem.config.js
 # Logs to ./logs/ directory
 ```
 
-## 🔍 Finding Validators
+## Finding Validators
 
 Find active validators at:
 - **TaoStats:** https://taostats.io/
@@ -214,7 +213,7 @@ Find active validators at:
 
 Make sure the validator is active on your chosen subnet!
 
-## ⚠️ Important Notes
+## Important Notes
 
 ### Minimum Stake Amounts
 
@@ -239,7 +238,7 @@ Check balance:
 btcli wallet balance --wallet.name [YOUR_WALLET]
 ```
 
-## 🛑 Stopping the Bot
+## Stopping the Bot
 
 **Interactive Mode:**
 Press `Ctrl+C` to stop the bot gracefully.
@@ -250,7 +249,7 @@ pm2 stop stake-bot     # Stop the bot
 pm2 delete stake-bot   # Stop and remove from PM2
 ```
 
-## 📊 Monitoring (PM2)
+## Monitoring (PM2)
 
 ```bash
 # View real-time logs
@@ -266,18 +265,18 @@ pm2 monit
 tail -f logs/stake-bot-out.log
 ```
 
-## 🔒 Security
+## Security
 
 ### Interactive Mode
-- ✅ Password entered interactively (not stored)
-- ✅ Runs in foreground (you see everything)
-- ✅ Easy to stop with Ctrl+C
+- Password entered interactively (not stored)
+- Runs in foreground (you see everything)
+- Easy to stop with Ctrl+C
 
 ### PM2 Mode
-- ⚠️ Password stored in config or environment variable
-- ✅ Runs as background process
-- ✅ Auto-restart on failure
-- ✅ Logs all activity
+- WARNING: Password stored in config or environment variable
+- Runs as background process
+- Auto-restart on failure
+- Logs all activity
 
 **Best Practices:**
 - Always test on test network first
@@ -288,7 +287,7 @@ tail -f logs/stake-bot-out.log
 - Keep logs secure (contains transaction info)
 - Use PM2 startup to ensure bot restarts after reboot
 
-## 🛠️ Troubleshooting
+## Troubleshooting
 
 ### "Wrong password"
 Make sure you're entering the correct wallet password. Test it first:
@@ -332,7 +331,7 @@ python3 stake_bot.py
 pm2 status
 ```
 
-## 📚 What is Block Time?
+## What is Block Time?
 
 Bittensor produces a new block approximately every **12 seconds**. The script:
 - Stakes in block N
@@ -341,14 +340,14 @@ Bittensor produces a new block approximately every **12 seconds**. The script:
 
 This ensures transactions are confirmed in separate blocks.
 
-## 📄 License
+## License
 
 MIT License
 
-## ⚠️ Disclaimer
+## Disclaimer
 
 This software is provided "as is" without warranty. Staking involves financial risk. Always test on test network first. Use at your own risk.
 
 ---
 
-**Simple, straightforward, and it works!** 🎯
+**Simple, straightforward, and it works!**
