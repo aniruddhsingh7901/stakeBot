@@ -108,9 +108,10 @@ Repeat... (if continuous mode)
 For rapid stake/unstake cycles without waiting for epochs:
 
 1. **Stakes** TAO to validator on specified subnet
-2. **Waits** for next block (~12 seconds)
-3. **Unstakes** immediately on the next block
-4. **Repeats** if continuous mode is enabled
+2. **Waits** 9 seconds (stays within same block)
+3. **Unstakes** within the same block (~2-3 seconds before next block)
+4. **Waits** 3 seconds between cycles
+5. **Repeats** if continuous mode is enabled
 
 ⚠️ **Note**: Block-by-block mode does NOT earn emissions! This mode is for testing or other purposes where you need rapid stake/unstake cycles.
 
@@ -119,14 +120,16 @@ For rapid stake/unstake cycles without waiting for epochs:
 ```
 Block N:       Stake 0.05 TAO
   ↓
-Wait ~12 seconds (1 block)
+Wait ~9 seconds (stay in same block)
   ↓
-Block N+1:     Unstake 0.05 TAO
+Block N:       Unstake 0.05 TAO (2-3 sec before next block)
   ↓
-60 seconds wait
+3 seconds wait
   ↓
 Repeat... (if continuous mode)
 ```
+
+**Total cycle time**: ~15 seconds (stake → wait → unstake → short wait)
 
 ## Configuration Options
 
@@ -316,17 +319,17 @@ Staking 0.05 TAO to subnet 51...
 Waiting for next block...
 ✓ New block: 6899885 (waited 12.3s, 1 blocks)
 
-⚡ Block mode: Holding stake for 1 block
-Staked on block: 6899885
-Will unstake on next block: 6899886
-✓ Next block reached: 6899886 (held for 12.1s)
+⚡ Block mode: Unstaking within same block
+Current block: 6899885
+Waiting 9 seconds before unstake (staying in same block)...
+✓ Still on block 6899885 (held for 9.0s) - ready to unstake
 
 Unstaking ‎0.769656036ת‎ from subnet 51...
 ✓ Successfully unstaked ‎0.769656036ת‎
 
 ✓ Cycle 1 completed successfully
 
-Waiting 60 seconds before next cycle...
+Waiting 3 seconds before next cycle...
 ```
 
 ## Managing Background Sessions

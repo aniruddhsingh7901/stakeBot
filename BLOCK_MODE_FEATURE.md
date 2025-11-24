@@ -7,8 +7,9 @@ Added a new "block mode" option to the stake bot that allows rapid stake/unstake
 
 ### What It Does
 - Stakes TAO on block N
-- Waits for next block (~12 seconds)
-- Unstakes immediately on block N+1
+- Waits 9 seconds (stays within same block)
+- Unstakes within same block N (~2-3 seconds before next block)
+- Waits only 3 seconds between cycles
 - Repeats if continuous mode is enabled
 
 ### When to Use
@@ -51,11 +52,12 @@ export STAKE_MODE=block  # 'epoch' (default) or 'block'
 
 | Feature | Epoch Mode | Block Mode |
 |---------|-----------|------------|
-| Hold Duration | 360 blocks (~72 min) | 1 block (~12 sec) |
+| Hold Duration | 360 blocks (~72 min) | 9 seconds (within same block) |
+| Wait Between Cycles | 60 seconds | 3 seconds |
 | Earns Emissions | ✅ Yes | ❌ No |
 | Best For | Earning TAO rewards | Testing, rapid cycles |
-| Cycle Time | ~72 minutes | ~12 seconds |
-| Continuous Loops/Day | ~20 cycles | ~7,200 cycles |
+| Cycle Time | ~72 minutes | ~15 seconds |
+| Continuous Loops/Day | ~20 cycles | ~5,760 cycles |
 
 ## Files Modified
 
@@ -76,10 +78,10 @@ export STAKE_MODE=block  # 'epoch' (default) or 'block'
 ## Example Output
 
 ```
-⚡ Block mode: Holding stake for 1 block
-Staked on block: 6899885
-Will unstake on next block: 6899886
-✓ Next block reached: 6899886 (held for 12.1s)
+⚡ Block mode: Unstaking within same block
+Current block: 6899885
+Waiting 9 seconds before unstake (staying in same block)...
+✓ Still on block 6899885 (held for 9.0s) - ready to unstake
 ```
 
 ## Usage Examples
@@ -89,7 +91,7 @@ Will unstake on next block: 6899886
 python3 stake_bot.py
 # Select mode: 2 (Block mode)
 # Select continuous: n
-# Result: One stake/unstake cycle in ~24 seconds
+# Result: One stake/unstake cycle in ~15 seconds
 ```
 
 ### Continuous Testing (Block Mode)

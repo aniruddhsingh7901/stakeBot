@@ -214,20 +214,21 @@ def main():
             
             # Handle different stake modes
             if STAKE_MODE == 'block':
-                # Block mode: Just wait for the next block then unstake
+                # Block mode: Unstake within the same block (9 seconds after stake)
                 start_block = new_block
-                print(f"\n⚡ Block mode: Holding stake for 1 block")
-                print(f"Staked on block: {start_block}")
-                print(f"Will unstake on next block: {start_block + 1}")
+                print(f"\n⚡ Block mode: Unstaking within same block")
+                print(f"Current block: {start_block}")
+                print(f"Waiting 9 seconds before unstake (staying in same block)...")
                 
                 epoch_start_time = time.time()
-                while True:
-                    current = subtensor.get_current_block()
-                    if current > start_block:
-                        elapsed_time = time.time() - epoch_start_time
-                        print(f"✓ Next block reached: {current} (held for {elapsed_time:.1f}s)")
-                        break
-                    time.sleep(1)
+                time.sleep(9)  # Wait 9 seconds to stay in same block (~12s blocks)
+                
+                elapsed_time = time.time() - epoch_start_time
+                current = subtensor.get_current_block()
+                if current == start_block:
+                    print(f"✓ Still on block {current} (held for {elapsed_time:.1f}s) - ready to unstake")
+                else:
+                    print(f"⚠ Block advanced to {current} (held for {elapsed_time:.1f}s) - proceeding with unstake")
             else:
                 # Epoch mode: Wait for full epoch duration
                 start_block = new_block
@@ -304,7 +305,11 @@ def main():
                 break
             
             # Wait before next cycle (allows balance to update and avoids spam)
-            wait_time = 60
+            if STAKE_MODE == 'block':
+                wait_time = 3  # Short wait for block mode (just enough for balance update)
+            else:
+                wait_time = 60  # Longer wait for epoch mode
+            
             print(f"\nWaiting {wait_time} seconds before next cycle (allows balance to update)...")
             time.sleep(wait_time)
             cycle += 1
