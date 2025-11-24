@@ -255,28 +255,28 @@ def main():
                     
                     time.sleep(10)  # Check every 10 seconds
             
-            # Get actual staked amount after staking for the specific subnet
-            if STAKE_MODE == 'block':
-                # Block mode: Skip slow query, just unstake the amount we staked
-                actual_staked = amount
-            else:
-                # Epoch mode: Query to get exact staked amount
-                stake_info_after = subtensor.get_stake_for_coldkey_and_hotkey(
-                    coldkey_ss58=wallet.coldkeypub.ss58_address,
-                    hotkey_ss58=VALIDATOR_HOTKEY
-                )
-                stake_after = stake_info_after.get(NETUID, None)
-                if stake_after:
+            # Get actual staked amount after staking - required for unstake!
+            stake_info_after = subtensor.get_stake_for_coldkey_and_hotkey(
+                coldkey_ss58=wallet.coldkeypub.ss58_address,
+                hotkey_ss58=VALIDATOR_HOTKEY
+            )
+            stake_after = stake_info_after.get(NETUID, None)
+            if stake_after:
+                if STAKE_MODE == 'block':
+                    # Block mode: Just get the current stake (fast)
+                    actual_staked = stake_after.stake
+                else:
+                    # Epoch mode: Calculate the difference
                     stake_after_amount = stake_after.stake
                     actual_staked = bt.Balance.from_rao(stake_after_amount.rao - stake_before_amount.rao)
                     actual_staked = actual_staked.set_unit(NETUID)
                     print(f"Actual staked amount: {actual_staked}")
-                else:
-                    print("✗ Error: Could not get stake info after staking")
-                    break
+            else:
+                print("✗ Error: Could not get stake info after staking")
+                break
             
             # Unstake the exact amount that was staked
-            print(f"\nUnstaking {STAKE_AMOUNT} TAO from subnet {NETUID}...")
+            print(f"\nUnstaking {actual_staked} from subnet {NETUID}...")
             try:
                 success = subtensor.unstake(
                     wallet=wallet,
