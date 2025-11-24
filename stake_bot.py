@@ -164,20 +164,24 @@ def main():
             current_block = subtensor.get_current_block()
             print(f"Current block: {current_block}")
             
-            # Get stake before staking for the specific subnet
-            stake_info_before = subtensor.get_stake_for_coldkey_and_hotkey(
-                coldkey_ss58=wallet.coldkeypub.ss58_address,
-                hotkey_ss58=VALIDATOR_HOTKEY
-            )
-            stake_before = stake_info_before.get(NETUID, None)
-            if stake_before:
-                print(f"Current stake on subnet {NETUID}: {stake_before.stake}")
-            else:
-                print(f"No existing stake on subnet {NETUID}")
+            # In block mode, skip the slow stake query - just stake and unstake fast!
+            if STAKE_MODE == 'block':
+                # Skip stake checking to save time
                 stake_before_amount = bt.Balance.from_rao(0)
-            
-            if stake_before:
-                stake_before_amount = stake_before.stake
+            else:
+                # Get stake before staking for the specific subnet (only in epoch mode)
+                print(f"Checking current stake on subnet {NETUID}...")
+                stake_info_before = subtensor.get_stake_for_coldkey_and_hotkey(
+                    coldkey_ss58=wallet.coldkeypub.ss58_address,
+                    hotkey_ss58=VALIDATOR_HOTKEY
+                )
+                stake_before = stake_info_before.get(NETUID, None)
+                if stake_before:
+                    print(f"Current stake on subnet {NETUID}: {stake_before.stake}")
+                    stake_before_amount = stake_before.stake
+                else:
+                    print(f"No existing stake on subnet {NETUID}")
+                    stake_before_amount = bt.Balance.from_rao(0)
             
             # Stake
             print(f"\nStaking {STAKE_AMOUNT} TAO to subnet {NETUID}...")
@@ -197,39 +201,26 @@ def main():
                 print(f"✗ Error staking: {e}")
                 break
             
-            # Wait for next block
-            print(f"\nWaiting for next block...")
-            block_wait_start = time.time()
-            while True:
-                new_block = subtensor.get_current_block()
-                if new_block > current_block:
-                    block_wait_time = time.time() - block_wait_start
-                    blocks_elapsed = new_block - current_block
-                    print(f"✓ New block: {new_block} (waited {block_wait_time:.1f}s, {blocks_elapsed} blocks)")
-                    if blocks_elapsed > 1:
-                        avg_block_time = block_wait_time / blocks_elapsed
-                        print(f"  Average block time: ~{avg_block_time:.1f}s")
-                    break
-                time.sleep(1)
-            
             # Handle different stake modes
             if STAKE_MODE == 'block':
-                # Block mode: Unstake within the same block (9 seconds after stake)
-                start_block = new_block
-                print(f"\n⚡ Block mode: Unstaking within same block")
-                print(f"Current block: {start_block}")
-                print(f"Waiting 9 seconds before unstake (staying in same block)...")
-                
-                epoch_start_time = time.time()
-                time.sleep(9)  # Wait 9 seconds to stay in same block (~12s blocks)
-                
-                elapsed_time = time.time() - epoch_start_time
-                current = subtensor.get_current_block()
-                if current == start_block:
-                    print(f"✓ Still on block {current} (held for {elapsed_time:.1f}s) - ready to unstake")
-                else:
-                    print(f"⚠ Block advanced to {current} (held for {elapsed_time:.1f}s) - proceeding with unstake")
+                # Block mode: NO WAIT - unstake immediately!
+                print(f"\n⚡ Block mode: Unstaking immediately (block {current_block})")
             else:
+                # Epoch mode: Wait for next block first
+                print(f"\nWaiting for next block...")
+                block_wait_start = time.time()
+                while True:
+                    new_block = subtensor.get_current_block()
+                    if new_block > current_block:
+                        block_wait_time = time.time() - block_wait_start
+                        blocks_elapsed = new_block - current_block
+                        print(f"✓ New block: {new_block} (waited {block_wait_time:.1f}s, {blocks_elapsed} blocks)")
+                        if blocks_elapsed > 1:
+                            avg_block_time = block_wait_time / blocks_elapsed
+                            print(f"  Average block time: ~{avg_block_time:.1f}s")
+                        break
+                    time.sleep(1)
+                
                 # Epoch mode: Wait for full epoch duration
                 start_block = new_block
                 target_block = start_block + BLOCKS_TO_WAIT
@@ -265,22 +256,27 @@ def main():
                     time.sleep(10)  # Check every 10 seconds
             
             # Get actual staked amount after staking for the specific subnet
-            stake_info_after = subtensor.get_stake_for_coldkey_and_hotkey(
-                coldkey_ss58=wallet.coldkeypub.ss58_address,
-                hotkey_ss58=VALIDATOR_HOTKEY
-            )
-            stake_after = stake_info_after.get(NETUID, None)
-            if stake_after:
-                stake_after_amount = stake_after.stake
-                actual_staked = bt.Balance.from_rao(stake_after_amount.rao - stake_before_amount.rao)
-                actual_staked = actual_staked.set_unit(NETUID)
-                print(f"Actual staked amount: {actual_staked}")
+            if STAKE_MODE == 'block':
+                # Block mode: Skip slow query, just unstake the amount we staked
+                actual_staked = amount
             else:
-                print("✗ Error: Could not get stake info after staking")
-                break
+                # Epoch mode: Query to get exact staked amount
+                stake_info_after = subtensor.get_stake_for_coldkey_and_hotkey(
+                    coldkey_ss58=wallet.coldkeypub.ss58_address,
+                    hotkey_ss58=VALIDATOR_HOTKEY
+                )
+                stake_after = stake_info_after.get(NETUID, None)
+                if stake_after:
+                    stake_after_amount = stake_after.stake
+                    actual_staked = bt.Balance.from_rao(stake_after_amount.rao - stake_before_amount.rao)
+                    actual_staked = actual_staked.set_unit(NETUID)
+                    print(f"Actual staked amount: {actual_staked}")
+                else:
+                    print("✗ Error: Could not get stake info after staking")
+                    break
             
             # Unstake the exact amount that was staked
-            print(f"\nUnstaking {actual_staked} from subnet {NETUID}...")
+            print(f"\nUnstaking {STAKE_AMOUNT} TAO from subnet {NETUID}...")
             try:
                 success = subtensor.unstake(
                     wallet=wallet,
@@ -306,12 +302,13 @@ def main():
             
             # Wait before next cycle (allows balance to update and avoids spam)
             if STAKE_MODE == 'block':
-                wait_time = 3  # Short wait for block mode (just enough for balance update)
+                # Block mode: NO WAIT - go immediately to next cycle
+                print(f"Starting next cycle immediately...")
             else:
                 wait_time = 60  # Longer wait for epoch mode
+                print(f"\nWaiting {wait_time} seconds before next cycle (allows balance to update)...")
+                time.sleep(wait_time)
             
-            print(f"\nWaiting {wait_time} seconds before next cycle (allows balance to update)...")
-            time.sleep(wait_time)
             cycle += 1
             
     except KeyboardInterrupt:
