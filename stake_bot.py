@@ -36,11 +36,18 @@ def main():
         WALLET_NAME = os.getenv('WALLET_NAME', 'default')
         HOTKEY_NAME = os.getenv('HOTKEY_NAME', 'default')
         VALIDATOR_HOTKEY = os.getenv('VALIDATOR_HOTKEY', '')
-        STAKE_AMOUNT = float(os.getenv('STAKE_AMOUNT', '0.05'))
+        STAKE_AMOUNT = float(os.getenv('STAKE_AMOUNT', '0.01'))
         NETUID = int(os.getenv('NETUID', '1'))
         NETWORK = os.getenv('NETWORK', 'test')
-        EPOCHS_TO_STAKE = int(os.getenv('EPOCHS_TO_STAKE', '1'))
-        BLOCKS_TO_WAIT = EPOCHS_TO_STAKE * 360  # 360 blocks per epoch (72 minutes)
+        STAKE_MODE = os.getenv('STAKE_MODE', 'epoch').lower()  # 'epoch' or 'block'
+        
+        if STAKE_MODE == 'block':
+            BLOCKS_TO_WAIT = 1  # Just wait for next block
+            EPOCHS_TO_STAKE = 0
+        else:
+            EPOCHS_TO_STAKE = int(os.getenv('EPOCHS_TO_STAKE', '1'))
+            BLOCKS_TO_WAIT = EPOCHS_TO_STAKE * 360  # 360 blocks per epoch (72 minutes)
+        
         CONTINUOUS = os.getenv('CONTINUOUS', 'false').lower() in ['true', 'yes', '1', 'y']
         WALLET_PASSWORD = os.getenv('WALLET_PASSWORD')
     else:
@@ -48,18 +55,31 @@ def main():
         WALLET_NAME = input("Enter wallet name [default]: ").strip() or "default"
         HOTKEY_NAME = input("Enter hotkey name [default]: ").strip() or "default"
         VALIDATOR_HOTKEY = input("Enter validator hotkey (SS58 address): ").strip()
-        STAKE_AMOUNT = float(input("Enter stake amount in TAO [0.05]: ").strip() or "0.05")
+        STAKE_AMOUNT = float(input("Enter stake amount in TAO [0.01]: ").strip() or "0.01")
         NETUID = int(input("Enter subnet ID [1]: ").strip() or "1")
         NETWORK = input("Enter network (test/finney) [test]: ").strip() or "test"
         
-        # Ask for stake duration
-        print("\nStake duration options:")
-        print("  1 epoch  = 360 blocks ≈ 72 minutes (minimum for emissions)")
-        print("  2 epochs = 720 blocks ≈ 144 minutes (2.4 hours)")
-        print("  3 epochs = 1080 blocks ≈ 216 minutes (3.6 hours)")
-        duration_input = input("Enter number of epochs to stake [1]: ").strip() or "1"
-        EPOCHS_TO_STAKE = int(duration_input)
-        BLOCKS_TO_WAIT = EPOCHS_TO_STAKE * 360  # 360 blocks per epoch
+        # Ask for stake mode
+        print("\nStake mode options:")
+        print("  1. Epoch mode - Stake and hold for full epoch(s) to earn emissions")
+        print("  2. Block mode - Stake on block N, unstake on block N+1 (rapid cycling)")
+        mode_input = input("Select mode (1 or 2) [1]: ").strip() or "1"
+        
+        if mode_input == "2":
+            STAKE_MODE = 'block'
+            BLOCKS_TO_WAIT = 1
+            EPOCHS_TO_STAKE = 0
+            print("Selected: Block-by-block mode (stake then immediately unstake on next block)")
+        else:
+            STAKE_MODE = 'epoch'
+            # Ask for stake duration
+            print("\nStake duration options:")
+            print("  1 epoch  = 360 blocks ≈ 72 minutes (minimum for emissions)")
+            print("  2 epochs = 720 blocks ≈ 144 minutes (2.4 hours)")
+            print("  3 epochs = 1080 blocks ≈ 216 minutes (3.6 hours)")
+            duration_input = input("Enter number of epochs to stake [1]: ").strip() or "1"
+            EPOCHS_TO_STAKE = int(duration_input)
+            BLOCKS_TO_WAIT = EPOCHS_TO_STAKE * 360  # 360 blocks per epoch
         
         CONTINUOUS = input("Run continuously? (y/n) [n]: ").strip().lower() == 'y'
         WALLET_PASSWORD = None
@@ -76,7 +96,11 @@ def main():
     print(f"  Validator: {VALIDATOR_HOTKEY}")
     print(f"  Amount: {STAKE_AMOUNT} TAO")
     print(f"  Subnet: {NETUID}")
-    print(f"  Stake Duration: {EPOCHS_TO_STAKE} epoch(s) = {BLOCKS_TO_WAIT} blocks ≈ {BLOCKS_TO_WAIT * 12 / 3600:.1f} hours")
+    print(f"  Stake Mode: {STAKE_MODE}")
+    if STAKE_MODE == 'block':
+        print(f"  Stake Duration: 1 block (stake then immediate unstake on next block)")
+    else:
+        print(f"  Stake Duration: {EPOCHS_TO_STAKE} epoch(s) = {BLOCKS_TO_WAIT} blocks ≈ {BLOCKS_TO_WAIT * 12 / 3600:.1f} hours")
     print(f"  Continuous: {CONTINUOUS}")
     print("=" * 70)
     
@@ -188,39 +212,56 @@ def main():
                     break
                 time.sleep(1)
             
-            # Now wait for the full epoch duration
-            start_block = new_block
-            target_block = start_block + BLOCKS_TO_WAIT
-            print(f"\n💎 Holding stake for {EPOCHS_TO_STAKE} epoch(s) ({BLOCKS_TO_WAIT} blocks)")
-            print(f"Start block: {start_block}")
-            print(f"Target block: {target_block}")
-            print(f"Estimated time: ~{BLOCKS_TO_WAIT * 12 / 3600:.1f} hours")
-            
-            epoch_start_time = time.time()
-            last_update = time.time()
-            
-            while True:
-                current = subtensor.get_current_block()
-                blocks_remaining = target_block - current
+            # Handle different stake modes
+            if STAKE_MODE == 'block':
+                # Block mode: Just wait for the next block then unstake
+                start_block = new_block
+                print(f"\n⚡ Block mode: Holding stake for 1 block")
+                print(f"Staked on block: {start_block}")
+                print(f"Will unstake on next block: {start_block + 1}")
                 
-                if current >= target_block:
-                    elapsed_time = time.time() - epoch_start_time
-                    print(f"\n✓ Epoch complete! Held for {elapsed_time / 3600:.2f} hours ({current - start_block} blocks)")
-                    break
+                epoch_start_time = time.time()
+                while True:
+                    current = subtensor.get_current_block()
+                    if current > start_block:
+                        elapsed_time = time.time() - epoch_start_time
+                        print(f"✓ Next block reached: {current} (held for {elapsed_time:.1f}s)")
+                        break
+                    time.sleep(1)
+            else:
+                # Epoch mode: Wait for full epoch duration
+                start_block = new_block
+                target_block = start_block + BLOCKS_TO_WAIT
+                print(f"\n💎 Holding stake for {EPOCHS_TO_STAKE} epoch(s) ({BLOCKS_TO_WAIT} blocks)")
+                print(f"Start block: {start_block}")
+                print(f"Target block: {target_block}")
+                print(f"Estimated time: ~{BLOCKS_TO_WAIT * 12 / 3600:.1f} hours")
                 
-                # Update progress every 60 seconds
-                if time.time() - last_update >= 60:
-                    blocks_done = current - start_block
-                    progress = (blocks_done / BLOCKS_TO_WAIT) * 100
-                    elapsed = time.time() - epoch_start_time
-                    estimated_total = (elapsed / blocks_done) * BLOCKS_TO_WAIT if blocks_done > 0 else 0
-                    remaining_time = estimated_total - elapsed
+                epoch_start_time = time.time()
+                last_update = time.time()
+                
+                while True:
+                    current = subtensor.get_current_block()
+                    blocks_remaining = target_block - current
                     
-                    print(f"  Progress: {progress:.1f}% ({blocks_done}/{BLOCKS_TO_WAIT} blocks) | "
-                          f"Elapsed: {elapsed/3600:.2f}h | Remaining: ~{remaining_time/3600:.2f}h")
-                    last_update = time.time()
-                
-                time.sleep(10)  # Check every 10 seconds
+                    if current >= target_block:
+                        elapsed_time = time.time() - epoch_start_time
+                        print(f"\n✓ Epoch complete! Held for {elapsed_time / 3600:.2f} hours ({current - start_block} blocks)")
+                        break
+                    
+                    # Update progress every 60 seconds
+                    if time.time() - last_update >= 60:
+                        blocks_done = current - start_block
+                        progress = (blocks_done / BLOCKS_TO_WAIT) * 100
+                        elapsed = time.time() - epoch_start_time
+                        estimated_total = (elapsed / blocks_done) * BLOCKS_TO_WAIT if blocks_done > 0 else 0
+                        remaining_time = estimated_total - elapsed
+                        
+                        print(f"  Progress: {progress:.1f}% ({blocks_done}/{BLOCKS_TO_WAIT} blocks) | "
+                              f"Elapsed: {elapsed/3600:.2f}h | Remaining: ~{remaining_time/3600:.2f}h")
+                        last_update = time.time()
+                    
+                    time.sleep(10)  # Check every 10 seconds
             
             # Get actual staked amount after staking for the specific subnet
             stake_info_after = subtensor.get_stake_for_coldkey_and_hotkey(

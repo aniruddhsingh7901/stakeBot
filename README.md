@@ -28,7 +28,8 @@ The script will prompt you for:
 - Stake amount in TAO (minimum 0.05)
 - Subnet ID
 - Network (test/finney)
-- Stake duration (number of epochs)
+- Stake mode (epoch or block-by-block)
+- Stake duration (number of epochs for epoch mode)
 - Continuous mode (y/n)
 - Wallet password (secure prompt)
 
@@ -68,7 +69,7 @@ screen -ls
 
 The bot performs strategic staking to earn emissions:
 
-### Epoch-Based Staking
+### Epoch-Based Staking (Recommended for Emissions)
 
 1. **Stakes** TAO to validator on specified subnet
 2. **Holds** for full epoch duration (360 blocks ≈ 72 minutes)
@@ -102,14 +103,47 @@ Block N+360:   Epoch complete - Emissions earned!
 Repeat... (if continuous mode)
 ```
 
+### Block-by-Block Staking (Rapid Cycling)
+
+For rapid stake/unstake cycles without waiting for epochs:
+
+1. **Stakes** TAO to validator on specified subnet
+2. **Waits** for next block (~12 seconds)
+3. **Unstakes** immediately on the next block
+4. **Repeats** if continuous mode is enabled
+
+⚠️ **Note**: Block-by-block mode does NOT earn emissions! This mode is for testing or other purposes where you need rapid stake/unstake cycles.
+
+### Block Timeline
+
+```
+Block N:       Stake 0.05 TAO
+  ↓
+Wait ~12 seconds (1 block)
+  ↓
+Block N+1:     Unstake 0.05 TAO
+  ↓
+60 seconds wait
+  ↓
+Repeat... (if continuous mode)
+```
+
 ## Configuration Options
+
+### Stake Mode
+- **Epoch mode** (recommended): Stakes and holds for full epoch(s) to earn emissions
+  - Choose this to earn TAO rewards
+  - Minimum 1 epoch (360 blocks ≈ 72 minutes)
+- **Block mode**: Stakes on block N, unstakes on block N+1
+  - For rapid testing or specific use cases
+  - ⚠️ Does NOT earn emissions!
 
 ### Stake Amount
 - **Minimum**: 0.05 TAO
 - **Recommended**: Start with 0.05-0.1 TAO for testing
 - **Note**: Include 5% buffer for transaction fees
 
-### Stake Duration
+### Stake Duration (Epoch Mode Only)
 - **1 epoch**: 360 blocks ≈ 72 minutes (minimum for emissions)
 - **2 epochs**: 720 blocks ≈ 144 minutes
 - **3 epochs**: 1080 blocks ≈ 216 minutes
@@ -219,6 +253,73 @@ Estimated time: ~1.2 hours
   Progress: 100.0% (360/360 blocks) | Elapsed: 1.20h | Remaining: ~0.00h
 
 ✓ Epoch complete! Held for 1.20 hours (360 blocks)
+
+Unstaking ‎0.769656036ת‎ from subnet 51...
+✓ Successfully unstaked ‎0.769656036ת‎
+
+✓ Cycle 1 completed successfully
+
+Waiting 60 seconds before next cycle...
+```
+
+### Example: Block Mode (Rapid Cycling)
+
+```bash
+$ python3 stake_bot.py
+
+======================================================================
+Bittensor Simple Stake Bot
+======================================================================
+
+Running in INTERACTIVE MODE
+Enter wallet name [default]: droplet
+Enter hotkey name [default]: 
+Enter validator hotkey (SS58 address): 5D7aRtpmVBKsQRzMA2ioUPL25onJPzBjiFVVt5uPZ3TDsn51
+Enter stake amount in TAO [0.05]: 0.05
+Enter subnet ID [1]: 51
+Enter network (test/finney) [test]: finney
+
+Stake mode options:
+  1. Epoch mode - Stake and hold for full epoch(s) to earn emissions
+  2. Block mode - Stake on block N, unstake on block N+1 (rapid cycling)
+Select mode (1 or 2) [1]: 2
+Selected: Block-by-block mode (stake then immediately unstake on next block)
+Run continuously? (y/n) [n]: y
+
+======================================================================
+Configuration:
+  Wallet: droplet
+  Hotkey: default
+  Network: finney
+  Validator: 5D7aRtpmVBKsQRzMA2ioUPL25onJPzBjiFVVt5uPZ3TDsn51
+  Amount: 0.05 TAO
+  Subnet: 51
+  Stake Mode: block
+  Stake Duration: 1 block (stake then immediate unstake on next block)
+  Continuous: True
+======================================================================
+
+Initializing wallet...
+✓ Wallet initialized
+
+Current balance: 0.234600549 TAO
+
+======================================================================
+Cycle 1
+======================================================================
+Current balance: 0.234600549 TAO
+Current block: 6899884
+
+Staking 0.05 TAO to subnet 51...
+✓ Successfully staked 0.05 TAO
+
+Waiting for next block...
+✓ New block: 6899885 (waited 12.3s, 1 blocks)
+
+⚡ Block mode: Holding stake for 1 block
+Staked on block: 6899885
+Will unstake on next block: 6899886
+✓ Next block reached: 6899886 (held for 12.1s)
 
 Unstaking ‎0.769656036ת‎ from subnet 51...
 ✓ Successfully unstaked ‎0.769656036ת‎

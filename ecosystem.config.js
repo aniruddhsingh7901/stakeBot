@@ -14,6 +14,8 @@
 //   - STAKE_AMOUNT: Amount to stake in TAO (default: 0.001)
 //   - NETUID: Subnet ID (default: 1)
 //   - NETWORK: 'test' or 'finney' (default: 'test')
+//   - STAKE_MODE: 'epoch' or 'block' (default: 'epoch')
+//   - EPOCHS_TO_STAKE: Number of epochs to hold (default: 1, only for 'epoch' mode)
 //   - CONTINUOUS: 'true' or 'false' (default: 'true')
 //
 // After editing, run: pm2 start ecosystem.config.js
@@ -34,7 +36,8 @@ module.exports = {
       STAKE_AMOUNT: '0.05',                      // Amount to stake (TAO) - min 0.05
       NETUID: '51',                              // Subnet ID
       NETWORK: 'finney',                         // 'test' or 'finney'
-      EPOCHS_TO_STAKE: '1',                      // Number of epochs (1 epoch = 360 blocks = 72 min)
+      STAKE_MODE: 'epoch',                       // 'epoch' (hold for full epoch) or 'block' (stake then unstake on next block)
+      EPOCHS_TO_STAKE: '1',                      // Number of epochs (1 epoch = 360 blocks = 72 min) - only used in 'epoch' mode
       CONTINUOUS: 'true',                        // 'true' for continuous operation
       WALLET_PASSWORD: '',                       // Leave empty - wallet must be unencrypted for PM2
       BT_WALLET_PASSWORD: '',                    // Leave empty - wallet must be unencrypted for PM2
