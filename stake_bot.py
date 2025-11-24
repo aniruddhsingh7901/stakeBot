@@ -149,20 +149,25 @@ def main():
             print(f"Cycle {cycle}")
             print("=" * 70)
             
-            # Check balance before each cycle
-            balance = subtensor.get_balance(wallet.coldkey.ss58_address)
-            print(f"Current balance: {balance.tao} TAO")
-            
-            # Check if we have enough balance (with some buffer for fees)
-            required_balance = STAKE_AMOUNT * 1.05  # 5% buffer for fees
-            if balance.tao < required_balance:
-                print(f"✗ Insufficient balance: {balance.tao} TAO < {required_balance} TAO (needed with fee buffer)")
-                print(f"Transaction fees have reduced balance below threshold")
-                break
+            # In block mode, skip slow balance check every cycle (only check first time)
+            if STAKE_MODE == 'block' and cycle > 1:
+                # Skip balance check to save time in rapid cycling
+                pass
+            else:
+                # Check balance before each cycle
+                balance = subtensor.get_balance(wallet.coldkey.ss58_address)
+                print(f"Current balance: {balance.tao} TAO")
+                
+                # Check if we have enough balance (with some buffer for fees)
+                required_balance = STAKE_AMOUNT * 1.05  # 5% buffer for fees
+                if balance.tao < required_balance:
+                    print(f"✗ Insufficient balance: {balance.tao} TAO < {required_balance} TAO (needed with fee buffer)")
+                    print(f"Transaction fees have reduced balance below threshold")
+                    break
             
             # Get current block
             current_block = subtensor.get_current_block()
-            print(f"Current block: {current_block}")
+            print(f"Block {current_block}")
             
             # In block mode, skip the slow stake query - just stake and unstake fast!
             if STAKE_MODE == 'block':
@@ -184,7 +189,7 @@ def main():
                     stake_before_amount = bt.Balance.from_rao(0)
             
             # Stake
-            print(f"\nStaking {STAKE_AMOUNT} TAO to subnet {NETUID}...")
+            print(f"Staking {STAKE_AMOUNT} TAO...")
             try:
                 success = subtensor.add_stake(
                     wallet=wallet,
@@ -193,7 +198,7 @@ def main():
                     netuid=NETUID
                 )
                 if success:
-                    print(f"✓ Successfully staked {STAKE_AMOUNT} TAO")
+                    print(f"✓ Staked")
                 else:
                     print("✗ Failed to stake")
                     break
@@ -203,8 +208,8 @@ def main():
             
             # Handle different stake modes
             if STAKE_MODE == 'block':
-                # Block mode: NO WAIT - unstake immediately!
-                print(f"\n⚡ Block mode: Unstaking immediately (block {current_block})")
+                # Block mode: Get stake and unstake immediately!
+                print(f"Getting stake...")
             else:
                 # Epoch mode: Wait for next block first
                 print(f"\nWaiting for next block...")
@@ -255,28 +260,37 @@ def main():
                     
                     time.sleep(10)  # Check every 10 seconds
             
-            # Get actual staked amount after staking - required for unstake!
-            stake_info_after = subtensor.get_stake_for_coldkey_and_hotkey(
-                coldkey_ss58=wallet.coldkeypub.ss58_address,
-                hotkey_ss58=VALIDATOR_HOTKEY
-            )
-            stake_after = stake_info_after.get(NETUID, None)
-            if stake_after:
-                if STAKE_MODE == 'block':
-                    # Block mode: Just get the current stake (fast)
+            # Get actual staked amount after staking
+            if STAKE_MODE == 'block':
+                # Block mode: Get stake immediately after staking
+                stake_info_after = subtensor.get_stake_for_coldkey_and_hotkey(
+                    coldkey_ss58=wallet.coldkeypub.ss58_address,
+                    hotkey_ss58=VALIDATOR_HOTKEY
+                )
+                stake_after = stake_info_after.get(NETUID, None)
+                if stake_after:
                     actual_staked = stake_after.stake
+                    print(f"Unstaking {actual_staked}...")
                 else:
-                    # Epoch mode: Calculate the difference
+                    print("✗ No stake found")
+                    break
+            else:
+                # Epoch mode: Query to get exact amount
+                stake_info_after = subtensor.get_stake_for_coldkey_and_hotkey(
+                    coldkey_ss58=wallet.coldkeypub.ss58_address,
+                    hotkey_ss58=VALIDATOR_HOTKEY
+                )
+                stake_after = stake_info_after.get(NETUID, None)
+                if stake_after:
                     stake_after_amount = stake_after.stake
                     actual_staked = bt.Balance.from_rao(stake_after_amount.rao - stake_before_amount.rao)
                     actual_staked = actual_staked.set_unit(NETUID)
                     print(f"Actual staked amount: {actual_staked}")
-            else:
-                print("✗ Error: Could not get stake info after staking")
-                break
-            
-            # Unstake the exact amount that was staked
-            print(f"\nUnstaking {actual_staked} from subnet {NETUID}...")
+                else:
+                    print("✗ Error: Could not get stake info after staking")
+                    break
+                
+                print(f"\nUnstaking {actual_staked} from subnet {NETUID}...")
             try:
                 success = subtensor.unstake(
                     wallet=wallet,
@@ -285,7 +299,10 @@ def main():
                     netuid=NETUID
                 )
                 if success:
-                    print(f"✓ Successfully unstaked {actual_staked}")
+                    if STAKE_MODE == 'block':
+                        print(f"✓ Unstaked | Cycle {cycle} done")
+                    else:
+                        print(f"✓ Successfully unstaked {actual_staked}")
                 else:
                     print("✗ Failed to unstake")
                     break
@@ -293,7 +310,8 @@ def main():
                 print(f"✗ Error unstaking: {e}")
                 break
             
-            print(f"\n✓ Cycle {cycle} completed successfully")
+            if STAKE_MODE != 'block':
+                print(f"\n✓ Cycle {cycle} completed successfully")
             
             # Check if we should continue
             if not CONTINUOUS:
