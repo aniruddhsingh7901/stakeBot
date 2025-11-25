@@ -112,6 +112,10 @@ DEFAULT_CONFIG = {
     "persist_state": True,
     "state_file": "stake_state.json",
 
+    # Event export per block
+    "export_events": True,               # write JSON file with all block events for every block
+    "events_dir": "block_events",        # directory to write per-block JSON files
+
     # Trigger safety
     "allow_overlap_triggers": False      # if False: don't trigger stake while an unstake is pending per-subnet
 }
@@ -233,6 +237,9 @@ class AutoStakeBot:
         self.subscription_mode = str(self.cfg.get("subscription_mode", "auto")).lower()
         self.header_timeout = float(self.cfg.get("header_wait_timeout_seconds", 3.0))
         self.poll_interval = float(self.cfg.get("poll_interval_seconds", 0.5))
+        # Event export
+        self.export_events = bool(self.cfg.get("export_events", True))
+        self.events_dir = str(self.cfg.get("events_dir", "block_events"))
 
         # Clients
         self.subtensor: Optional[bt.Subtensor] = None         # primary client (headers)
@@ -393,6 +400,13 @@ class AutoStakeBot:
         # Load persisted schedule
         self._load_state()
 
+        # Ensure events export dir exists if enabled
+        if self.export_events:
+            try:
+                os.makedirs(self.events_dir, exist_ok=True)
+            except Exception as e:
+                self.logger.warning("Failed to create events_dir '%s': %s", self.events_dir, str(e))
+
     def _ensure_events_client(self):
         if self.substrate_events is None:
             try:
@@ -428,6 +442,77 @@ class AutoStakeBot:
                     return []
             self.logger.warning("Failed to fetch events for block %s: %s", block_number, es)
             return []
+
+    def _normalize_events(self, raw_events) -> List[Dict[str, Any]]:
+        """Normalize substrate-interface EventRecords into JSON-friendly dicts."""
+        out: List[Dict[str, Any]] = []
+        for ev in raw_events or []:
+            try:
+                evval = ev.value if hasattr(ev, "value") else ev
+                evt = evval.get("event", {}) if isinstance(evval, dict) else {}
+                module_id = evt.get("module_id") or evt.get("pallet") or evt.get("module") or ""
+                event_id = evt.get("event_id") or evt.get("event") or evt.get("name") or ""
+
+                # phase may be in top-level or under event
+                phase = evval.get("phase") if isinstance(evval, dict) else None
+                if isinstance(phase, dict):
+                    # e.g., {'ApplyExtrinsic': 77} or {'Finalization': None}
+                    phase_type = next(iter(phase.keys()), None)
+                    phase_value = phase.get(phase_type)
+                    phase_str = phase_type
+                    extrinsic_idx = phase_value if isinstance(phase_value, int) else None
+                else:
+                    phase_str = str(phase) if phase is not None else None
+                    extrinsic_idx = None
+
+                # parameters under multiple keys
+                params = (
+                    evt.get("attributes")
+                    or evt.get("params")
+                    or evt.get("data")
+                    or evt.get("args")
+                    or []
+                )
+                norm_params: List[Dict[str, Any]] = []
+                for p in params:
+                    if isinstance(p, dict):
+                        # keep only name/value
+                        norm_params.append({"name": p.get("name", ""), "value": p.get("value")})
+                    else:
+                        norm_params.append({"name": "", "value": p})
+
+                out.append({
+                    "module": module_id,
+                    "event": event_id,
+                    "phase": phase_str,
+                    "extrinsic_index": extrinsic_idx,
+                    "params": norm_params
+                })
+            except Exception as e:
+                out.append({"error": f"normalize_failed: {str(e)}"})
+        return out
+
+    def _export_block_events(self, block_number: int, events) -> None:
+        """Write per-block JSON file with normalized events."""
+        if not self.export_events:
+            return
+        try:
+            block_hash = self.substrate_events.get_block_hash(block_number)
+        except Exception:
+            block_hash = None
+        try:
+            normalized = self._normalize_events(events)
+            payload = {
+                "block_number": block_number,
+                "block_hash": block_hash,
+                "timestamp": int(time.time()),
+                "events": normalized
+            }
+            path = os.path.join(self.events_dir, f"{block_number}.json")
+            with open(path, "w") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            self.logger.warning("Failed to export events for block %d: %s", block_number, str(e))
 
     def _count_stake_added_by_subnet(self, events) -> Dict[int, int]:
         """Return {netuid: count} of StakeAdded in provided events (robust parsing across SDK variants)."""
@@ -685,6 +770,9 @@ class AutoStakeBot:
         """Fetch events for block_number, count stakes per subnet, trigger stake if any count >= 2."""
         try:
             events = self._events_for_block(block_number)
+            # Export raw events to JSON per block if enabled
+            if self.export_events:
+                self._export_block_events(block_number, events)
             counts = self._count_stake_added_by_subnet(events)
             if not counts:
                 self.logger.debug("Block %d: no StakeAdded events", block_number)
