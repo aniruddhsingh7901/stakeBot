@@ -39,6 +39,9 @@ import signal
 import logging
 from logging.handlers import RotatingFileHandler
 from typing import Optional, Dict, Any, List
+import inspect
+import queue
+import threading
 
 import bittensor as bt
 try:
@@ -646,7 +649,7 @@ class AutoStakeBot:
                 self.logger.warning("Unstake submission failed; will retry on next block")
 
     def monitor_blocks(self):
-        """Continuous subscription to new block headers (websocket)."""
+        """Continuous monitoring of new blocks with subscription-callback if available, otherwise iterator or polling fallback."""
         self.logger.info("Starting block monitor. Target subnet: %d | Stake amount: %.8f TAO | fast_mode=%s",
                          self.subnet_id, self.stake_amount_tao, self.fast_mode)
 
@@ -657,36 +660,110 @@ class AutoStakeBot:
         backoff = float(self.cfg["ws_reconnect_backoff_seconds"])
         max_backoff = float(self.cfg["ws_reconnect_max_backoff_seconds"])
 
+        def parse_block_number(header_obj: Any) -> Optional[int]:
+            try:
+                number = header_obj["header"]["number"]
+                return int(number, 16) if isinstance(number, str) else int(number)
+            except Exception:
+                try:
+                    number = header_obj.get("number", header_obj.get("block", {}).get("header", {}).get("number"))
+                    return int(number, 16) if isinstance(number, str) else int(number)
+                except Exception:
+                    return None
+
         while not self._shutdown:
             try:
-                self.logger.info("Subscribing to new block headers...")
-                for header in self.substrate.subscribe_block_headers():
-                    if self._shutdown:
-                        break
+                # Detect subscribe_block_headers signature and choose mode
+                use_callback = False
+                try:
+                    sig = inspect.signature(self.substrate.subscribe_block_headers)
+                    # If at least one required positional parameter is present, it's callback style
+                    required = [p for p in sig.parameters.values() if p.default is p.empty]
+                    use_callback = len(required) >= 1
+                except Exception:
+                    use_callback = False
 
-                    # header structure differs across substrate-interface versions; try to normalize
+                if use_callback:
+                    self.logger.info("Subscribing to new block headers (callback mode)...")
+                    q: "queue.Queue[Any]" = queue.Queue(maxsize=1024)
+
+                    def handler(obj, update_nr=None, subscription_id=None):
+                        try:
+                            q.put_nowait(obj)
+                        except Exception:
+                            # Drop if queue is full to avoid blocking
+                            pass
+
+                    # Start subscription in a separate context - this blocks, so we need to handle it differently
+                    # The subscription call itself will block, so we consume from queue in the main thread
+                    import threading
+                    
+                    def subscription_thread():
+                        try:
+                            self.substrate.subscribe_block_headers(handler)
+                        except Exception as e:
+                            self.logger.warning("Subscription thread error: %s", str(e))
+                            q.put(None)  # Signal error
+                    
+                    thread = threading.Thread(target=subscription_thread, daemon=True)
+                    thread.start()
+
+                    while not self._shutdown:
+                        try:
+                            header = q.get(timeout=30.0)
+                            if header is None:
+                                # Error signal from subscription thread
+                                raise RuntimeError("Subscription thread encountered an error")
+                        except queue.Empty:
+                            # Check if thread is still alive
+                            if not thread.is_alive():
+                                raise RuntimeError("Subscription thread died")
+                            continue
+                        
+                        block_number = parse_block_number(header)
+                        if block_number is None:
+                            continue
+                        self.last_analyzed_block = block_number
+                        self.logger.debug("New block: %d", block_number)
+                        # Unstake first, then analyze
+                        self.execute_unstake(block_number)
+                        self.analyze_block(block_number)
+                else:
+                    self.logger.info("Subscribing to new block headers (iterator mode or polling fallback)...")
+                    # Try iterator mode first
                     try:
-                        number = header["header"]["number"]
-                        if isinstance(number, str):
-                            block_number = int(number, 16)
-                        else:
-                            block_number = int(number)
-                    except Exception:
-                        number = header.get("number", header.get("block", {}).get("header", {}).get("number"))
-                        block_number = int(number, 16) if isinstance(number, str) else int(number)
+                        for header in self.substrate.subscribe_block_headers():
+                            if self._shutdown:
+                                break
+                            block_number = parse_block_number(header)
+                            if block_number is None:
+                                continue
+                            self.last_analyzed_block = block_number
+                            self.logger.debug("New block: %d", block_number)
+                            self.execute_unstake(block_number)
+                            self.analyze_block(block_number)
+                    except TypeError:
+                        # Fallback to polling if iterator not supported in this SDK
+                        self.logger.info("Iterator mode not supported; falling back to polling current block...")
+                        last_seen = None
+                        while not self._shutdown:
+                            try:
+                                current = self.subtensor.get_current_block()
+                                if last_seen is None or current > last_seen:
+                                    last_seen = current
+                                    self.last_analyzed_block = current
+                                    self.logger.debug("New block (poll): %d", current)
+                                    self.execute_unstake(current)
+                                    self.analyze_block(current)
+                                time.sleep(0.5)
+                            except Exception as pe:
+                                self.logger.warning("Polling error: %s", str(pe))
+                                break
 
-                    self.last_analyzed_block = block_number
-                    self.logger.debug("New block: %d", block_number)
-
-                    # Execute any pending unstake scheduled for this block first
-                    self.execute_unstake(block_number)
-
-                    # Then analyze the block that just arrived
-                    self.analyze_block(block_number)
-
-                # If the generator exits without exception, short pause before re-subscribing
+                # Short breather before re-subscribing if loop exits normally
                 if not self._shutdown:
-                    time.sleep(0.2)
+                    time.sleep(0.05)
+
             except Exception as e:
                 if self._shutdown:
                     break
