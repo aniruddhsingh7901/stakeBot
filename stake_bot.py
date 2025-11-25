@@ -214,6 +214,9 @@ class AutoStakeBot:
 
         self.subtensor: Optional[bt.Subtensor] = None
         self.substrate = None
+        # Dedicated client for event queries to avoid websocket recv conflicts with subscription thread
+        self.events_subtensor: Optional[bt.Subtensor] = None
+        self.substrate_events = None
         self.wallet: Optional[Any] = None
         self.nonce_mgr: Optional[NonceManager] = None
 
@@ -324,6 +327,13 @@ class AutoStakeBot:
         self.subtensor = bt.Subtensor(network=self.network)
         # Underlying substrate client (websocket)
         self.substrate = self.subtensor.substrate
+        # Separate substrate for event queries to avoid 'recv already running' conflicts
+        try:
+            self.events_subtensor = bt.Subtensor(network=self.network)
+            self.substrate_events = self.events_subtensor.substrate
+        except Exception as e:
+            self.logger.warning("Failed to initialize separate events substrate: %s", str(e))
+            self.substrate_events = self.substrate
         self.logger.info("Connected to network: %s", self.network)
 
         # Nonce manager for the signer (coldkey is the payer)
@@ -342,16 +352,44 @@ class AutoStakeBot:
         # Restore persisted state if any
         self._load_state()
 
+    def _ensure_events_client(self):
+        """Ensure a dedicated events substrate client exists (separate websocket)."""
+        if self.substrate_events is None:
+            try:
+                self.events_subtensor = bt.Subtensor(network=self.network)
+                self.substrate_events = self.events_subtensor.substrate
+            except Exception as e:
+                self.logger.warning("Recreating events substrate failed: %s", str(e))
+                self.substrate_events = self.substrate
+
     def _events_for_block(self, block_number: int):
         """Fetch events for a given block number. Returns list of event records, or []"""
+        # Always use the dedicated events substrate to avoid recv conflict with subscription thread
+        self._ensure_events_client()
         try:
-            block_hash = self.substrate.get_block_hash(block_number)
+            block_hash = self.substrate_events.get_block_hash(block_number)
             if block_hash is None:
                 return []
-            events = self.substrate.get_events(block_hash=block_hash)
+            events = self.substrate_events.get_events(block_hash=block_hash)
             return events or []
         except Exception as e:
-            self.logger.warning("Failed to fetch events for block %s: %s", block_number, str(e))
+            es = str(e)
+            # Handle recv conflicts by recreating the events substrate and retrying once
+            if "cannot call recv while another thread is already running recv" in es or "recv_streaming" in es:
+                self.logger.warning("Events client recv conflict; recreating events substrate and retrying...")
+                try:
+                    # Recreate client
+                    self.events_subtensor = bt.Subtensor(network=self.network)
+                    self.substrate_events = self.events_subtensor.substrate
+                    block_hash = self.substrate_events.get_block_hash(block_number)
+                    if block_hash is None:
+                        return []
+                    events = self.substrate_events.get_events(block_hash=block_hash)
+                    return events or []
+                except Exception as e2:
+                    self.logger.warning("Retry failed for block %s: %s", block_number, str(e2))
+                    return []
+            self.logger.warning("Failed to fetch events for block %s: %s", block_number, es)
             return []
 
     def _count_stake_added_for_subnet(self, events, target_subnet: int) -> int:
