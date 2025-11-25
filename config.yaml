@@ -9,6 +9,8 @@ wallet_name: default
 hotkey_name: default
 # Optional: set once to avoid interactive prompt every run (stored in env during process)
 wallet_password: ""
+# Optional: stake to a validator's hotkey (SS58) on the target subnet. Leave empty to stake to your own hotkey.
+target_hotkey: ""
 
 # Stake amount in TAO (floating point). Example: 0.05
 stake_amount: 0.05

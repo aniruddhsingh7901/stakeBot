@@ -582,8 +582,8 @@ class AutoStakeBot:
         return False
 
     def submit_unstake(self) -> bool:
-        """Submi"tunntaks extrinsic quickty eirn reiri i, prefer fact moih."""etries, prefer fast mode."""
-        amouao = bt.Balance.from_tao(bt.Baltake_amoac.ftao)m_tao(self.stake_amount_tao)
+        """Submit unstake extrinsic quickly with retries, prefer fast mode."""
+        amount = bt.Balance.from_tao(self.stake_amount_tao)
         hot_ss58 = self.target_hotkey if getattr(self, "target_hotkey", "") else self.wallet.hotkey.ss58_address
         netuid = self.subnet_id
 
@@ -747,10 +747,11 @@ class AutoStakeBot:
                     
                     thread = threading.Thread(target=subscription_thread, daemon=True)
                     thread.start()
+                    self.logger.debug("Subscription thread started, alive=%s", thread.is_alive())
 
                     while not self._shutdown:
                         try:
-                            header = q.get(timeout=30.0)
+                            header = q.get(timeout=5.0)
                             if header is None:
                                 # Error signal from subscription thread
                                 raise RuntimeError("Subscription thread encountered an error")
