@@ -430,37 +430,99 @@ class AutoStakeBot:
             return []
 
     def _count_stake_added_by_subnet(self, events) -> Dict[int, int]:
-        """Return {netuid: count} of StakeAdded in provided events."""
+        """Return {netuid: count} of StakeAdded in provided events (robust parsing across SDK variants)."""
         counts: Dict[int, int] = {}
         accepted_event_ids = {"StakeAdded"}
         accepted_modules = {"SubtensorModule", "Subtensor"}  # pallet naming variants
 
+        def _coerce_int(val) -> Optional[int]:
+            # Convert ints or numeric strings to int
+            if isinstance(val, int):
+                return val
+            if isinstance(val, str):
+                try:
+                    # Some SDKs return numbers as strings
+                    if val.lower().startswith("0x"):
+                        # hex decode; but netuid should be small; try hex parse
+                        return int(val, 16)
+                    return int(val)
+                except Exception:
+                    return None
+            return None
+
+        stakeadded_seen = 0
+        failed_parse = 0
+
         for ev in events or []:
             try:
+                # substrate-interface yields EventRecord with .value -> dict having 'event'
                 evval = ev.value if hasattr(ev, "value") else ev
                 evt = evval.get("event", {})
-                module_id = evt.get("module_id") or evt.get("pallet") or ""
-                event_id = evt.get("event_id") or evt.get("event") or ""
+                # Some versions use 'module_id'/'event_id', others 'pallet'/'event' or 'module'/'name'
+                module_id = evt.get("module_id") or evt.get("pallet") or evt.get("module") or ""
+                event_id = evt.get("event_id") or evt.get("event") or evt.get("name") or ""
                 if module_id not in accepted_modules or event_id not in accepted_event_ids:
                     continue
-                params = evt.get("attributes") or evt.get("params") or []
-                ev_netuid = None
+
+                stakeadded_seen += 1
+
+                # Params may be under 'attributes', 'params', 'data', or 'args'
+                params = (
+                    evt.get("attributes")
+                    or evt.get("params")
+                    or evt.get("data")
+                    or evt.get("args")
+                    or []
+                )
+
+                ev_netuid: Optional[int] = None
+                candidates: List[int] = []
+
+                # Normalize params to list of dicts
+                norm_params: List[Dict[str, Any]] = []
                 for p in params:
                     if isinstance(p, dict):
-                        name = (p.get("name") or "").lower()
-                        if name == "netuid":
-                            try:
-                                ev_netuid = int(p.get("value"))
-                            except Exception:
-                                pass
+                        norm_params.append(p)
+                    else:
+                        # handle tuple-like or raw values
+                        norm_params.append({"name": "", "value": p})
+
+                # First pass: prefer explicit name 'netuid'
+                for p in norm_params:
+                    name = (p.get("name") or "").lower()
+                    val = p.get("value")
+                    if name == "netuid":
+                        v = _coerce_int(val)
+                        if v is not None:
+                            ev_netuid = v
                             break
-                        if ev_netuid is None and isinstance(p.get("value"), int):
-                            ev_netuid = int(p.get("value"))
+
+                # Second pass: collect all small integers (likely netuid) and pick the most plausible
                 if ev_netuid is None:
+                    for p in norm_params:
+                        v = _coerce_int(p.get("value"))
+                        # Netuid is a small integer (u16/u32), while tao/alpha are very large; filter by range
+                        if v is not None and 0 <= v <= 65535:
+                            candidates.append(v)
+                    if candidates:
+                        # Heuristic: netuid often appears later in the param list; choose the last small int
+                        ev_netuid = candidates[-1]
+
+                if ev_netuid is None:
+                    failed_parse += 1
+                    # Emit a compact debug for troubleshooting
+                    self.logger.debug("StakeAdded present but netuid parse failed: evt_keys=%s params_count=%d",
+                                      list(evt.keys()), len(norm_params))
                     continue
+
                 counts[ev_netuid] = counts.get(ev_netuid, 0) + 1
-            except Exception:
+            except Exception as e:
+                failed_parse += 1
+                self.logger.debug("StakeAdded parse error: %s", str(e))
                 continue
+
+        if stakeadded_seen > 0 and sum(counts.values()) == 0:
+            self.logger.debug("StakeAdded seen=%d but no netuid extracted (failed=%d)", stakeadded_seen, failed_parse)
 
         return counts
 
