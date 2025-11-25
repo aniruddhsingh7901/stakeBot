@@ -3,6 +3,8 @@
 
 # Network to connect to: "finney" (mainnet) or "test"
 network: finney
+# Optional: custom websocket RPC endpoint (e.g., wss://your-node:443). Leave empty to use default providers.
+chain_endpoint: ""
 
 # Bittensor wallet identifiers
 wallet_name: default
@@ -15,7 +17,9 @@ target_hotkey: ""
 # Stake amount in TAO (floating point). Example: 0.05
 stake_amount: 0.05
 
-# Target subnet ID to monitor and stake on. Default: 63 (SN63)
+# Subnet targeting mode: "any" triggers on any subnet with >=2 StakeAdded in a block; "single" restricts to subnet_id
+subnet_mode: any
+# When subnet_mode: single, only this subnet id will trigger (default 63 shown as example)
 subnet_id: 63
 
 # =========================
@@ -49,6 +53,8 @@ ws_reconnect_max_backoff_seconds: 8.0
 # =========================
 subscription_mode: poll           # auto | callback | poll
 header_wait_timeout_seconds: 3.0  # since blocks are ~12s, use 2-3s to fallback fast
+# Polling interval (seconds) when subscription_mode is poll or when falling back to poll
+poll_interval_seconds: 0.5
 
 # =========================
 # Logging configuration

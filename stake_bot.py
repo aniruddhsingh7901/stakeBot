@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Bittensor Automated Event-Driven Staking Bot (WS-first, Production-optimized)
+Bittensor Automated Event-Driven Staking Bot (WS-first, Any-Subnet, Production-optimized)
 
 Objective:
 - Monitor every new block with minimal latency
-- Count StakeAdded events on the target subnet per block
-- If count >= 2 for block N -> submit stake ASAP (best-effort N/N+1)
-- Schedule unstake for N+1 and execute promptly
+- Count StakeAdded events per subnet (netuid) in each block
+- If any subnet in block N has >= 2 StakeAdded events -> submit stake to that subnet ASAP (best-effort N/N+1)
+- Schedule unstake for N+1 on that same subnet and execute promptly
 - Repeat reliably with robust reconnects, concurrency, and fallbacks
 
 Key Architecture:
 - Websocket-first:
   - Subscribe to new heads (best effort earliest visibility)
-  - Optional: Subscribe to System.Events (storage) when available
+  - Optional: Subscribe to System.Events (storage) when available (future enhancement)
 - Separate websocket clients:
   - Client A: headers
-  - Client B: events (optional)
+  - Client B: events (dedicated, used for get_events per-block; upgradeable to subscribe storage)
   - Client C: extrinsics
 - Fallbacks:
   - Iterator mode headers
@@ -34,7 +34,9 @@ Config:
     - optional chain_endpoint (single) or leave empty to use defaults
     - wallet_name, hotkey_name, wallet_password
     - target_hotkey (validator hotkey SS58 on target subnet) or leave empty to stake to your own hotkey
-    - stake_amount (TAO), subnet_id
+    - subnet_mode: "any" (stake on any subnet that triggers) or "single"
+    - subnet_id (used only when subnet_mode == "single")
+    - stake_amount (TAO)
     - fast_mode, tip_tao, wait_for_inclusion/finalization
     - subscription_mode: auto | callback | poll
     - header_wait_timeout_seconds
@@ -76,7 +78,10 @@ DEFAULT_CONFIG = {
     "wallet_password": "",               # optional: set to avoid repeated prompt per run
     "target_hotkey": "",                 # optional: stake to this hotkey (validator) if set; otherwise your wallet's hotkey
     "stake_amount": 0.05,                # TAO
-    "subnet_id": 63,                     # default target subnet
+
+    # Subnet targeting
+    "subnet_mode": "any",                # "any" -> trigger on any subnet; "single" -> only on subnet_id
+    "subnet_id": 63,                     # used only when subnet_mode == "single"
 
     # Performance & behavior
     "fast_mode": True,                   # explicit nonce & tip, zero-wait extrinsics
@@ -108,7 +113,7 @@ DEFAULT_CONFIG = {
     "state_file": "stake_state.json",
 
     # Trigger safety
-    "allow_overlap_triggers": False      # if False: don't trigger stake while an unstake is pending
+    "allow_overlap_triggers": False      # if False: don't trigger stake while an unstake is pending per-subnet
 }
 
 CONFIG_PATH = os.environ.get("STAKE_BOT_CONFIG", "config.yaml")
@@ -216,7 +221,8 @@ class AutoStakeBot:
         self.wallet_name = self.cfg["wallet_name"]
         self.hotkey_name = self.cfg["hotkey_name"]
         self.target_hotkey = str(self.cfg.get("target_hotkey", "")).strip()
-        self.subnet_id = int(self.cfg["subnet_id"])
+        self.subnet_mode = str(self.cfg.get("subnet_mode", "any")).lower()
+        self.subnet_id = int(self.cfg.get("subnet_id", 63))
         self.stake_amount_tao = float(self.cfg["stake_amount"])
 
         self.fast_mode = bool(self.cfg.get("fast_mode", True))
@@ -240,10 +246,13 @@ class AutoStakeBot:
         self.wallet: Optional[Any] = None
         self.nonce_mgr: Optional[NonceManager] = None
 
-        # State (trigger/unstake coordination)
+        # State (trigger/unstake coordination) per subnet
         self.last_analyzed_block: Optional[int] = None
-        self.last_staked_block: Optional[int] = None
-        self.pending_unstake_block: Optional[int] = None
+        self.last_staked_block_map: Dict[int, int] = {}        # netuid -> last staked block
+        self.pending_unstake_blocks: Dict[int, int] = {}       # netuid -> scheduled unstake block
+        # Legacy single fields kept for migration
+        self._legacy_last_staked_block: Optional[int] = None
+        self._legacy_pending_unstake_block: Optional[int] = None
 
         # Concurrency/threading
         self._shutdown = False
@@ -268,14 +277,28 @@ class AutoStakeBot:
     def _load_state(self):
         if not self.cfg.get("persist_state", True):
             return
+        path = self.cfg.get("state_file", "stake_state.json")
         try:
-            if os.path.exists(self.cfg.get("state_file", "stake_state.json")):
-                with open(self.cfg.get("state_file", "stake_state.json"), "r") as f:
+            if os.path.exists(path):
+                with open(path, "r") as f:
                     s = json.load(f)
-                self.last_staked_block = s.get("last_staked_block")
-                self.pending_unstake_block = s.get("pending_unstake_block")
-                self.logger.info("Restored state: last_staked_block=%s pending_unstake_block=%s",
-                                 self.last_staked_block, self.pending_unstake_block)
+                # New format
+                self.last_staked_block_map = s.get("last_staked_block_map", {}) or {}
+                self.pending_unstake_blocks = s.get("pending_unstake_blocks", {}) or {}
+                # Legacy migration
+                self._legacy_last_staked_block = s.get("last_staked_block")
+                self._legacy_pending_unstake_block = s.get("pending_unstake_block")
+                migrated = False
+                if self._legacy_last_staked_block is not None and self.subnet_mode == "single":
+                    self.last_staked_block_map[self.subnet_id] = int(self._legacy_last_staked_block)
+                    migrated = True
+                if self._legacy_pending_unstake_block is not None and self.subnet_mode == "single":
+                    self.pending_unstake_blocks[self.subnet_id] = int(self._legacy_pending_unstake_block)
+                    migrated = True
+                if migrated:
+                    self.logger.info("Migrated legacy state to per-subnet state maps.")
+                self.logger.info("Restored state: last_staked_block_map=%s pending_unstake_blocks=%s",
+                                 self.last_staked_block_map, self.pending_unstake_blocks)
         except Exception as e:
             self.logger.warning("Failed to load state: %s", str(e))
 
@@ -284,8 +307,11 @@ class AutoStakeBot:
             return
         try:
             s = {
-                "last_staked_block": self.last_staked_block,
-                "pending_unstake_block": self.pending_unstake_block
+                "last_staked_block_map": self.last_staked_block_map,
+                "pending_unstake_blocks": self.pending_unstake_blocks,
+                # legacy fields kept for back-compat with older versions
+                "last_staked_block": self._legacy_last_staked_block,
+                "pending_unstake_block": self._legacy_pending_unstake_block
             }
             with open(self.cfg.get("state_file", "stake_state.json"), "w") as f:
                 json.dump(s, f)
@@ -301,12 +327,10 @@ class AutoStakeBot:
         self.logger.info("Initializing wallet and network connection...")
 
         # Wallet creation
-        # Compatible across SDK versions: prefer factory on bt
         wallet_factory = getattr(bt, "wallet", None)
         if callable(wallet_factory):
             self.wallet = wallet_factory(name=self.wallet_name, hotkey=self.hotkey_name)
         else:
-            # Best-effort fallback
             from bittensor.wallet import Wallet as WalletCls  # may fail on older SDKs
             self.wallet = WalletCls(name=self.wallet_name, hotkey=self.hotkey_name)
 
@@ -405,10 +429,10 @@ class AutoStakeBot:
             self.logger.warning("Failed to fetch events for block %s: %s", block_number, es)
             return []
 
-    def _count_stake_added_for_subnet(self, events, target_subnet: int) -> int:
-        """Count StakeAdded for target subnet across possible naming variants."""
-        count = 0
-        accepted_event_ids = {"StakeAdded"}  # canonical
+    def _count_stake_added_by_subnet(self, events) -> Dict[int, int]:
+        """Return {netuid: count} of StakeAdded in provided events."""
+        counts: Dict[int, int] = {}
+        accepted_event_ids = {"StakeAdded"}
         accepted_modules = {"SubtensorModule", "Subtensor"}  # pallet naming variants
 
         for ev in events or []:
@@ -417,10 +441,8 @@ class AutoStakeBot:
                 evt = evval.get("event", {})
                 module_id = evt.get("module_id") or evt.get("pallet") or ""
                 event_id = evt.get("event_id") or evt.get("event") or ""
-
                 if module_id not in accepted_modules or event_id not in accepted_event_ids:
                     continue
-
                 params = evt.get("attributes") or evt.get("params") or []
                 ev_netuid = None
                 for p in params:
@@ -432,17 +454,15 @@ class AutoStakeBot:
                             except Exception:
                                 pass
                             break
-                        # fallback heuristic
                         if ev_netuid is None and isinstance(p.get("value"), int):
                             ev_netuid = int(p.get("value"))
                 if ev_netuid is None:
                     continue
-                if ev_netuid == target_subnet:
-                    count += 1
+                counts[ev_netuid] = counts.get(ev_netuid, 0) + 1
             except Exception:
                 continue
 
-        return count
+        return counts
 
     def _best_effort_tip_rao(self) -> Optional[int]:
         if self.tip_tao <= 0:
@@ -455,7 +475,6 @@ class AutoStakeBot:
     def _submit_extrinsic_fast(self, call_module: str, call_function_candidates: List[str], params: Dict[str, Any]) -> Optional[str]:
         """Submit extrinsic via dedicated tx substrate with explicit nonce & tip (no waits)."""
         try:
-            # Compose call by trying candidate function names
             call = None
             func_used = None
             for func in call_function_candidates:
@@ -506,11 +525,12 @@ class AutoStakeBot:
                     self.nonce_mgr.refresh()
             return None
 
-    def submit_stake(self) -> bool:
+    def submit_stake(self, netuid: Optional[int] = None) -> bool:
         """Submit stake extrinsic quickly with retries (prefer fast path)."""
+        if netuid is None:
+            netuid = self.subnet_id
         amount = bt.Balance.from_tao(self.stake_amount_tao)
         hot_ss58 = self.target_hotkey if self.target_hotkey else self.wallet.hotkey.ss58_address
-        netuid = self.subnet_id
 
         max_retries = int(self.cfg["max_retries"])
         backoff = float(self.cfg["retry_backoff_seconds"])
@@ -552,11 +572,12 @@ class AutoStakeBot:
         self.logger.error("Failed to submit stake after %d attempts", max_retries)
         return False
 
-    def submit_unstake(self) -> bool:
+    def submit_unstake(self, netuid: Optional[int] = None) -> bool:
         """Submit unstake extrinsic quickly with retries (prefer fast path)."""
+        if netuid is None:
+            netuid = self.subnet_id
         amount = bt.Balance.from_tao(self.stake_amount_tao)
         hot_ss58 = self.target_hotkey if self.target_hotkey else self.wallet.hotkey.ss58_address
-        netuid = self.subnet_id
 
         max_retries = int(self.cfg["max_retries"])
         backoff = float(self.cfg["retry_backoff_seconds"])
@@ -599,47 +620,71 @@ class AutoStakeBot:
         return False
 
     def analyze_block(self, block_number: int):
-        """Fetch events for block_number, count stakes for target subnet, trigger stake if count >= 2."""
+        """Fetch events for block_number, count stakes per subnet, trigger stake if any count >= 2."""
         try:
-            if not self.cfg.get("allow_overlap_triggers", False) and self.pending_unstake_block is not None:
-                self.logger.debug("Unstake pending for block %s; skip trigger at block %s",
-                                  self.pending_unstake_block, block_number)
+            events = self._events_for_block(block_number)
+            counts = self._count_stake_added_by_subnet(events)
+            if not counts:
+                self.logger.debug("Block %d: no StakeAdded events", block_number)
                 return
 
-            events = self._events_for_block(block_number)
-            count = self._count_stake_added_for_subnet(events, self.subnet_id)
-            self.logger.debug("Block %d: StakeAdded count on subnet %d = %d", block_number, self.subnet_id, count)
+            # Determine which subnets to consider based on mode
+            candidate_netuids: List[int] = []
+            if self.subnet_mode == "any":
+                candidate_netuids = [n for n, c in counts.items() if c >= 2]
+            else:
+                # single mode
+                if counts.get(self.subnet_id, 0) >= 2:
+                    candidate_netuids = [self.subnet_id]
 
-            if count >= 2:
-                if self.last_staked_block == block_number:
-                    self.logger.debug("Already staked on block %d; skipping", block_number)
-                    return
-                self.logger.info("Trigger condition met at block %d: >=2 StakeAdded on subnet %d", block_number, self.subnet_id)
-                self.trigger_stake(block_number)
+            for netuid in candidate_netuids:
+                if not self.cfg.get("allow_overlap_triggers", False) and netuid in self.pending_unstake_blocks:
+                    self.logger.debug("Unstake pending for netuid %d; skip trigger at block %d", netuid, block_number)
+                    continue
+
+                # Ensure we don't double-trigger on same block for same subnet
+                if self.last_staked_block_map.get(netuid) == block_number:
+                    self.logger.debug("Already staked on block %d for subnet %d; skipping", block_number, netuid)
+                    continue
+
+                self.logger.info("Trigger condition met at block %d: >=2 StakeAdded on subnet %d (count=%d)",
+                                 block_number, netuid, counts.get(netuid, 0))
+                self.trigger_stake(block_number, netuid)
         except Exception as e:
             self.logger.warning("analyze_block error for block %d: %s", block_number, str(e))
 
-    def trigger_stake(self, block_number: int):
-        """Submit stake and record next block for unstake."""
-        ok = self.submit_stake()
+    def trigger_stake(self, block_number: int, netuid: Optional[int] = None):
+        """Submit stake and record next block for unstake on the given subnet."""
+        if netuid is None:
+            netuid = self.subnet_id
+        ok = self.submit_stake(netuid)
         if ok:
-            self.last_staked_block = block_number
-            self.pending_unstake_block = block_number + 1
+            self.last_staked_block_map[netuid] = block_number
+            self.pending_unstake_blocks[netuid] = block_number + 1
+            # update legacy for back-compat if single mode
+            if self.subnet_mode == "single":
+                self._legacy_last_staked_block = block_number
+                self._legacy_pending_unstake_block = block_number + 1
             self._save_state()
-            self.logger.info("Scheduled UNSTAKE at block %d", self.pending_unstake_block)
+            self.logger.info("Scheduled UNSTAKE at block %d for subnet %d", block_number + 1, netuid)
 
     def execute_unstake(self, current_block: int):
-        """If pending_unstake_block == current_block (or passed), submit unstake."""
-        if self.pending_unstake_block is None:
-            return
-        if current_block >= self.pending_unstake_block:
-            self.logger.info("Unstake due at block %d (scheduled: %d)", current_block, self.pending_unstake_block)
-            ok = self.submit_unstake()
+        """Submit unstake for any subnet whose scheduled block <= current_block."""
+        due: List[int] = []
+        for netuid, when in list(self.pending_unstake_blocks.items()):
+            if current_block >= when:
+                due.append(netuid)
+
+        for netuid in due:
+            self.logger.info("Unstake due at block %d for subnet %d (scheduled: %d)", current_block, netuid, self.pending_unstake_blocks[netuid])
+            ok = self.submit_unstake(netuid)
             if ok:
-                self.pending_unstake_block = None
+                del self.pending_unstake_blocks[netuid]
+                if self.subnet_mode == "single":
+                    self._legacy_pending_unstake_block = None
                 self._save_state()
             else:
-                self.logger.warning("Unstake submission failed; will retry on next block")
+                self.logger.warning("Unstake submission failed for subnet %d; will retry on next block", netuid)
 
     def _header_subscription_loop(self, handler, q: "queue.Queue[Any]", sub_exc: Dict[str, Any]):
         """Background thread function: subscribe_block_headers(handler)."""
@@ -665,8 +710,9 @@ class AutoStakeBot:
 
     def monitor_blocks(self):
         """Continuous monitoring: callback (preferred) or fallback to iterator/poll, with reconnects."""
-        self.logger.info("Starting block monitor. Target subnet: %d | Stake amount: %.8f TAO | fast_mode=%s",
-                         self.subnet_id, self.stake_amount_tao, self.fast_mode)
+        mode_info = f"{self.subnet_mode} mode"
+        self.logger.info("Starting block monitor (%s). Stake amount: %.8f TAO | fast_mode=%s",
+                         mode_info, self.stake_amount_tao, self.fast_mode)
 
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -789,7 +835,7 @@ class AutoStakeBot:
         self._shutdown = True
 
 
-# Module-level functions expected by the earlier spec
+# Module-level functions for compatibility
 def monitor_blocks():
     if BOT is None:
         raise RuntimeError("Bot not initialized")
