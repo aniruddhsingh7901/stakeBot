@@ -45,9 +45,15 @@ ws_reconnect_backoff_seconds: 1.0
 ws_reconnect_max_backoff_seconds: 8.0
 
 # =========================
+# Subscription strategy overrides (force reliable mode on this server)
+# =========================
+subscription_mode: poll           # auto | callback | poll
+header_wait_timeout_seconds: 3.0  # since blocks are ~12s, use 2-3s to fallback fast
+
+# =========================
 # Logging configuration
 # =========================
-log_level: INFO         # DEBUG | INFO | WARNING | ERROR
+log_level: DEBUG         # DEBUG | INFO | WARNING | ERROR
 log_to_file: true
 log_file: stake_bot.log
 

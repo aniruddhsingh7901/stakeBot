@@ -81,6 +81,10 @@ DEFAULT_CONFIG = {
     "ws_reconnect_backoff_seconds": 1.0,
     "ws_reconnect_max_backoff_seconds": 8.0,
 
+    # Subscription strategy
+    "subscription_mode": "auto",        # auto | callback | poll
+    "header_wait_timeout_seconds": 15.0,
+
     # Logging
     "log_level": "INFO",                # DEBUG | INFO | WARNING | ERROR
     "log_to_file": True,
@@ -699,6 +703,8 @@ class AutoStakeBot:
 
         backoff = float(self.cfg["ws_reconnect_backoff_seconds"])
         max_backoff = float(self.cfg["ws_reconnect_max_backoff_seconds"])
+        subscription_mode = str(self.cfg.get("subscription_mode", "auto")).lower()
+        header_timeout = float(self.cfg.get("header_wait_timeout_seconds", 15.0))
 
         def parse_block_number(header_obj: Any) -> Optional[int]:
             try:
@@ -715,13 +721,18 @@ class AutoStakeBot:
             try:
                 # Detect subscribe_block_headers signature and choose mode
                 use_callback = False
-                try:
-                    sig = inspect.signature(self.substrate.subscribe_block_headers)
-                    # If at least one required positional parameter is present, it's callback style
-                    required = [p for p in sig.parameters.values() if p.default is p.empty]
-                    use_callback = len(required) >= 1
-                except Exception:
+                if subscription_mode == "poll":
                     use_callback = False
+                elif subscription_mode == "callback":
+                    use_callback = True
+                else:
+                    try:
+                        sig = inspect.signature(self.substrate.subscribe_block_headers)
+                        # If at least one required positional parameter is present, it's callback style
+                        required = [p for p in sig.parameters.values() if p.default is p.empty]
+                        use_callback = len(required) >= 1
+                    except Exception:
+                        use_callback = False
 
                 if use_callback:
                     self.logger.info("Subscribing to new block headers (callback mode)...")
@@ -747,7 +758,9 @@ class AutoStakeBot:
                     
                     thread = threading.Thread(target=subscription_thread, daemon=True)
                     thread.start()
-                    self.logger.debug("Subscription thread started, alive=%s", thread.is_alive())
+                    self.logger.info("Subscription thread started (callback mode).")
+                    received_any_header = False
+                    deadline = time.time() + header_timeout
 
                     while not self._shutdown:
                         try:
@@ -759,11 +772,16 @@ class AutoStakeBot:
                             # Check if thread is still alive
                             if not thread.is_alive():
                                 raise RuntimeError("Subscription thread died")
+                            # Fallback if no headers received within timeout
+                            if not received_any_header and time.time() > deadline:
+                                self.logger.info("No headers received within %.1fs. Falling back to polling mode.", header_timeout)
+                                break
                             continue
                         
                         block_number = parse_block_number(header)
                         if block_number is None:
                             continue
+                        received_any_header = True
                         self.last_analyzed_block = block_number
                         self.logger.debug("New block: %d", block_number)
                         # Unstake first, then analyze
