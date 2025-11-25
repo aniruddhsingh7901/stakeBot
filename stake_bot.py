@@ -725,7 +725,6 @@ class AutoStakeBot:
         return resolved
 
     def _submit_extrinsic_fast(self, call_module: str, call_function_candidates: List[str], params: Dict[str, Any]) -> Optional[str]:
-    def _submit_extrinsic_fast(self, call_module: str, call_function_candidates: List[str], params: Dict[str, Any]) -> Optional[str]:
         """Submit extrinsic via dedicated tx substrate with explicit nonce & tip (no waits)."""
         try:
             call = None
