@@ -41,6 +41,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Optional, Dict, Any, List
 
 import bittensor as bt
+from bittensor.wallet import Wallet
 
 # Optional YAML dependency with minimal fallback parser
 try:
@@ -54,6 +55,7 @@ DEFAULT_CONFIG = {
     "network": "finney",                # "finney" (mainnet) or "test"
     "wallet_name": "default",
     "hotkey_name": "default",
+    "wallet_password": "",
     "stake_amount": 0.05,               # TAO
     "subnet_id": 63,                    # default target subnet
 
@@ -206,7 +208,7 @@ class AutoStakeBot:
 
         self.subtensor: Optional[bt.Subtensor] = None
         self.substrate = None
-        self.wallet: Optional[bt.wallet] = None
+        self.wallet: Optional[Wallet] = None
         self.nonce_mgr: Optional[NonceManager] = None
 
         # State for trigger/unstake coordination
@@ -266,14 +268,27 @@ class AutoStakeBot:
     def initialize(self):
         self.logger.info("Initializing wallet and network connection...")
         # Wallet
-        self.wallet = bt.wallet(name=self.wallet_name, hotkey=self.hotkey_name)
+        self.wallet = Wallet(name=self.wallet_name, hotkey=self.hotkey_name)
         self.wallet.create_if_non_existent()
 
-        # Try to unlock coldkey (will prompt if encrypted)
+        # Unlock coldkey once per process (supports config/env), prompt only once if needed
         try:
-            self.wallet.unlock_coldkey()
-            self.logger.info("Wallet unlocked")
+            pw = str(self.cfg.get("wallet_password", "")).strip()
+            if pw:
+                os.environ["BT_WALLET_PASSWORD"] = pw
+            try:
+                self.wallet.unlock_coldkey()
+                self.logger.info("Wallet unlocked")
+            except Exception as e1:
+                import getpass
+                self.logger.info("Wallet unlock needs password; prompting once...")
+                pw_input = getpass.getpass("Wallet password: ")
+                if pw_input:
+                    os.environ["BT_WALLET_PASSWORD"] = pw_input
+                self.wallet.unlock_coldkey()
+                self.logger.info("Wallet unlocked")
         except Exception as e:
+            # Wallet may be unencrypted or already unlocked
             self.logger.info("Wallet loaded (unencrypted or already unlocked): %s", str(e))
 
         # Subtensor / network connect

@@ -7,6 +7,8 @@ network: finney
 # Bittensor wallet identifiers
 wallet_name: default
 hotkey_name: default
+# Optional: set once to avoid interactive prompt every run (stored in env during process)
+wallet_password: ""
 
 # Stake amount in TAO (floating point). Example: 0.05
 stake_amount: 0.05
