@@ -269,8 +269,8 @@ class AutoStakeBot:
 
         # Runtime call discovery/caching
         self.call_pallet: Optional[str] = None
-        self.stake_call_candidates: List[str] = ["add_stake", "addStake", "add_stake_limit", "addStakeLimit"]
-        self.unstake_call_candidates: List[str] = ["remove_stake", "removeStake", "remove_stake_limit", "removeStakeLimit", "remove_stake_full_limit", "removeStakeFullLimit"]
+        self.stake_call_candidates: List[str] = ["add_stake"]
+        self.unstake_call_candidates: List[str] = ["remove_stake"]
 
         # Concurrency/threading
         self._shutdown = False
@@ -657,15 +657,29 @@ class AutoStakeBot:
         """Return ordered argument names for a call from runtime metadata."""
         try:
             meta = self.substrate_tx.get_metadata_call_function(call_module, call_name)
-            # substrate-interface returns dict with 'args' entries having 'name'
-            args = meta.get("args") or []
+            args = (meta or {}).get("args") or []
+            # Fallback: try alternate pallet aliases if no args returned
+            if not args:
+                for alt in ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]:
+                    if alt == call_module:
+                        continue
+                    try:
+                        alt_meta = self.substrate_tx.get_metadata_call_function(alt, call_name)
+                        alt_args = (alt_meta or {}).get("args") or []
+                        if alt_args:
+                            self.logger.debug("Resolved metadata args for %s using alternate pallet '%s'", call_name, alt)
+                            args = alt_args
+                            break
+                    except Exception:
+                        continue
             names: List[str] = []
             for a in args:
                 n = a.get("name")
                 if isinstance(n, str):
                     names.append(n)
             return names if names else None
-        except Exception:
+        except Exception as e:
+            self.logger.debug("get_metadata_call_function failed for %s.%s: %s", call_module, call_name, str(e))
             return None
 
     def _build_params_for_call(self, call_module: str, call_name: str, provided: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -674,17 +688,22 @@ class AutoStakeBot:
         trying common synonyms across runtime versions.
         """
         expected = self._get_call_args(call_module, call_name)
+        self.logger.debug("Metadata args for %s.%s: %s", call_module, call_name, expected)
         if not expected:
             # Fall back to provided as-is if metadata is not accessible
             return provided
 
-        # synonym map per logical field
+        # synonym map per logical field (keys must match expected arg names from metadata)
         synonyms: Dict[str, List[str]] = {
-            # Stake add amount synonyms
-            "amount": ["amount", "stake", "stake_to_be_added", "stake_to_add", "value"],
-            # Unstake amount synonyms
-            "alpha_unstaked": ["alpha_unstaked", "amount", "unstake_amount", "value"],
-            # Hotkey and netuid are stable but include lowercase variants
+            # Stake amount field can be named 'amount_staked' on-chain
+            "amount_staked": ["amount_staked", "amount", "stake_to_be_added", "stake_to_add", "stake", "value"],
+            # Some runtimes may still use 'amount'
+            "amount": ["amount", "amount_staked", "stake_to_be_added", "stake_to_add", "stake", "value"],
+            # Unstake amount field can be named 'amount_unstaked' on-chain
+            "amount_unstaked": ["amount_unstaked", "alpha_unstaked", "amount", "unstake_amount", "value"],
+            # Older codepaths/users may provide 'alpha_unstaked'
+            "alpha_unstaked": ["alpha_unstaked", "amount_unstaked", "amount", "unstake_amount", "value"],
+            # Hotkey and netuid are relatively stable
             "hotkey": ["hotkey", "who", "account", "hotKey"],
             "netuid": ["netuid", "netUid", "net_uid", "subnet_id", "netUidId"],
         }
@@ -813,13 +832,19 @@ class AutoStakeBot:
             try:
                 if self.fast_mode:
                     self.logger.info("Submitting STAKE fast %.8f TAO on subnet %s (attempt %d/%d)", self.stake_amount_tao, str(netuid), attempt, max_retries)
-                    modules = [self.call_pallet] if self.call_pallet else ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]
+                    modules = (list(dict.fromkeys([self.call_pallet, "SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]))
+                               if self.call_pallet else ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"])
                     funcs = self.stake_call_candidates
                     # Param variants across runtime versions
                     for pv in (
-                        {"hotkey": hot_ss58, "amount": int(amount.rao), "netuid": int(netuid)},
-                        {"hotkey": hot_ss58, "stake_to_be_added": int(amount.rao), "netuid": int(netuid)},
+                        {"hotkey": hot_ss58, "netuid": int(netuid), "amount_staked": int(amount.rao)},
+                        {"netuid": int(netuid), "amount_staked": int(amount.rao)},
+                        {"hotkey": hot_ss58, "netuid": int(netuid), "amount": int(amount.rao)},
+                        {"netuid": int(netuid), "amount": int(amount.rao)},
+                        {"hotkey": hot_ss58, "netuid": int(netuid), "stake_to_be_added": int(amount.rao)},
+                        {"netuid": int(netuid), "stake_to_be_added": int(amount.rao)}
                     ):
+                        self.logger.debug("Trying fast compose %s.%s with params=%s", (modules[0] if modules else "SubtensorModule"), (funcs[0] if funcs else "add_stake"), list(pv.keys()))
                         if self._submit_extrinsic_multi(modules, funcs, pv):
                             return True
                     self.logger.debug("Fast path failed; falling back to SDK path.")
@@ -872,12 +897,18 @@ class AutoStakeBot:
             try:
                 if self.fast_mode:
                     self.logger.info("Submitting UNSTAKE fast %.8f TAO on subnet %s (attempt %d/%d)", self.stake_amount_tao, str(netuid), attempt, max_retries)
-                    modules = [self.call_pallet] if self.call_pallet else ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]
+                    modules = (list(dict.fromkeys([self.call_pallet, "SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]))
+                               if self.call_pallet else ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"])
                     funcs = self.unstake_call_candidates
                     for pv in (
-                        {"hotkey": hot_ss58, "alpha_unstaked": int(amount.rao), "netuid": int(netuid)},
-                        {"hotkey": hot_ss58, "amount": int(amount.rao), "netuid": int(netuid)},
+                        {"hotkey": hot_ss58, "netuid": int(netuid), "amount_unstaked": int(amount.rao)},
+                        {"netuid": int(netuid), "amount_unstaked": int(amount.rao)},
+                        {"hotkey": hot_ss58, "netuid": int(netuid), "alpha_unstaked": int(amount.rao)},
+                        {"netuid": int(netuid), "alpha_unstaked": int(amount.rao)},
+                        {"hotkey": hot_ss58, "netuid": int(netuid), "amount": int(amount.rao)},
+                        {"netuid": int(netuid), "amount": int(amount.rao)}
                     ):
+                        self.logger.debug("Trying fast compose %s.%s with params=%s", (modules[0] if modules else "SubtensorModule"), (funcs[0] if funcs else "remove_stake"), list(pv.keys()))
                         if self._submit_extrinsic_multi(modules, funcs, pv):
                             return True
                     self.logger.debug("Fast path failed; falling back to SDK path.")
