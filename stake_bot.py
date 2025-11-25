@@ -52,7 +52,7 @@ import json
 import signal
 import logging
 from logging.handlers import RotatingFileHandler
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 import inspect
 import queue
 import threading
@@ -102,6 +102,9 @@ DEFAULT_CONFIG = {
     "subscription_mode": "auto",         # auto | callback | poll
     "header_wait_timeout_seconds": 3.0,  # fallback if no headers in this time (since ~12s blocks, 2-3s is aggressive)
     "poll_interval_seconds": 0.5,        # polling interval when in poll mode
+
+    # Submission behavior
+    "no_sdk_fallback": True,             # if True, do not fallback to SDK path; only use fast extrinsic
 
     # Logging
     "log_level": "INFO",                 # DEBUG | INFO | WARNING | ERROR
@@ -224,7 +227,9 @@ class AutoStakeBot:
 
         self.wallet_name = self.cfg["wallet_name"]
         self.hotkey_name = self.cfg["hotkey_name"]
+        # If set, stake/unstake is directed to this hotkey (delegation); otherwise your own wallet.hotkey
         self.target_hotkey = str(self.cfg.get("target_hotkey", "")).strip()
+
         self.subnet_mode = str(self.cfg.get("subnet_mode", "any")).lower()
         self.subnet_id = int(self.cfg.get("subnet_id", 63))
         self.stake_amount_tao = float(self.cfg["stake_amount"])
@@ -237,6 +242,7 @@ class AutoStakeBot:
         self.subscription_mode = str(self.cfg.get("subscription_mode", "auto")).lower()
         self.header_timeout = float(self.cfg.get("header_wait_timeout_seconds", 3.0))
         self.poll_interval = float(self.cfg.get("poll_interval_seconds", 0.5))
+        self.no_sdk_fallback = bool(self.cfg.get("no_sdk_fallback", True))
         # Event export
         self.export_events = bool(self.cfg.get("export_events", True))
         self.events_dir = str(self.cfg.get("events_dir", "block_events"))
@@ -260,6 +266,11 @@ class AutoStakeBot:
         # Legacy single fields kept for migration
         self._legacy_last_staked_block: Optional[int] = None
         self._legacy_pending_unstake_block: Optional[int] = None
+
+        # Runtime call discovery/caching
+        self.call_pallet: Optional[str] = None
+        self.stake_call_candidates: List[str] = ["add_stake", "addStake", "add_stake_limit", "addStakeLimit"]
+        self.unstake_call_candidates: List[str] = ["remove_stake", "removeStake", "remove_stake_limit", "removeStakeLimit", "remove_stake_full_limit", "removeStakeFullLimit"]
 
         # Concurrency/threading
         self._shutdown = False
@@ -384,6 +395,12 @@ class AutoStakeBot:
             self.logger.warning("Failed to initialize separate tx substrate: %s", str(e))
             self.substrate_tx = self.substrate
 
+        # Discover canonical pallet and available call names
+        try:
+            self._discover_call_endpoints()
+        except Exception as e:
+            self.logger.warning("Call discovery failed (will use defaults): %s", str(e))
+
         self.logger.info("Connected to network: %s", self.network)
 
         # Nonce manager (signer is coldkey)
@@ -415,6 +432,45 @@ class AutoStakeBot:
             except Exception as e:
                 self.logger.warning("Recreating events substrate failed: %s", str(e))
                 self.substrate_events = self.substrate
+
+    def _discover_call_endpoints(self):
+        """Discover canonical pallet and available call names from runtime metadata."""
+        modules = ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]
+        chosen = None
+        for m in modules:
+            try:
+                # probe a known call to verify pallet presence
+                self.substrate_tx.get_call_index(m, "add_stake")
+                chosen = m
+                break
+            except Exception:
+                continue
+        self.call_pallet = chosen or "SubtensorModule"
+
+        filtered_stake: List[str] = []
+        for fn in self.stake_call_candidates:
+            try:
+                self.substrate_tx.get_call_index(self.call_pallet, fn)
+                filtered_stake.append(fn)
+            except Exception:
+                continue
+        if filtered_stake:
+            self.stake_call_candidates = filtered_stake
+
+        filtered_unstake: List[str] = []
+        for fn in self.unstake_call_candidates:
+            try:
+                self.substrate_tx.get_call_index(self.call_pallet, fn)
+                filtered_unstake.append(fn)
+            except Exception:
+                continue
+        if filtered_unstake:
+            self.unstake_call_candidates = filtered_unstake
+
+        self.logger.info(
+            "Using pallet '%s' with stake calls=%s unstake calls=%s",
+            self.call_pallet, self.stake_call_candidates, self.unstake_call_candidates
+        )
 
     def _events_for_block(self, block_number: int):
         """Fetch events for a given block via dedicated events client. Returns list or []"""
@@ -514,44 +570,31 @@ class AutoStakeBot:
         except Exception as e:
             self.logger.warning("Failed to export events for block %d: %s", block_number, str(e))
 
-    def _count_stake_added_by_subnet(self, events) -> Dict[int, int]:
-        """Return {netuid: count} of StakeAdded in provided events (robust parsing across SDK variants)."""
+    def _count_event_by_subnet(self, events, event_names: Set[str]) -> Dict[int, int]:
+        """Return {netuid: count} for any of event_names in provided events."""
         counts: Dict[int, int] = {}
-        accepted_event_ids = {"StakeAdded"}
-        accepted_modules = {"SubtensorModule", "Subtensor"}  # pallet naming variants
 
         def _coerce_int(val) -> Optional[int]:
-            # Convert ints or numeric strings to int
             if isinstance(val, int):
                 return val
             if isinstance(val, str):
                 try:
-                    # Some SDKs return numbers as strings
                     if val.lower().startswith("0x"):
-                        # hex decode; but netuid should be small; try hex parse
                         return int(val, 16)
                     return int(val)
                 except Exception:
                     return None
             return None
 
-        stakeadded_seen = 0
-        failed_parse = 0
-
         for ev in events or []:
             try:
-                # substrate-interface yields EventRecord with .value -> dict having 'event'
                 evval = ev.value if hasattr(ev, "value") else ev
-                evt = evval.get("event", {})
-                # Some versions use 'module_id'/'event_id', others 'pallet'/'event' or 'module'/'name'
+                evt = evval.get("event", {}) if isinstance(evval, dict) else {}
                 module_id = evt.get("module_id") or evt.get("pallet") or evt.get("module") or ""
                 event_id = evt.get("event_id") or evt.get("event") or evt.get("name") or ""
-                if module_id not in accepted_modules or event_id not in accepted_event_ids:
+                if module_id not in {"SubtensorModule", "Subtensor"} or event_id not in event_names:
                     continue
 
-                stakeadded_seen += 1
-
-                # Params may be under 'attributes', 'params', 'data', or 'args'
                 params = (
                     evt.get("attributes")
                     or evt.get("params")
@@ -561,55 +604,46 @@ class AutoStakeBot:
                 )
 
                 ev_netuid: Optional[int] = None
-                candidates: List[int] = []
-
-                # Normalize params to list of dicts
                 norm_params: List[Dict[str, Any]] = []
                 for p in params:
                     if isinstance(p, dict):
                         norm_params.append(p)
                     else:
-                        # handle tuple-like or raw values
                         norm_params.append({"name": "", "value": p})
 
-                # First pass: prefer explicit name 'netuid'
+                # Prefer explicit named 'netuid'
                 for p in norm_params:
                     name = (p.get("name") or "").lower()
-                    val = p.get("value")
                     if name == "netuid":
-                        v = _coerce_int(val)
+                        v = _coerce_int(p.get("value"))
                         if v is not None:
                             ev_netuid = v
                             break
 
-                # Second pass: collect all small integers (likely netuid) and pick the most plausible
+                # Fallback: choose last small int
                 if ev_netuid is None:
+                    candidates: List[int] = []
                     for p in norm_params:
                         v = _coerce_int(p.get("value"))
-                        # Netuid is a small integer (u16/u32), while tao/alpha are very large; filter by range
                         if v is not None and 0 <= v <= 65535:
                             candidates.append(v)
                     if candidates:
-                        # Heuristic: netuid often appears later in the param list; choose the last small int
                         ev_netuid = candidates[-1]
 
-                if ev_netuid is None:
-                    failed_parse += 1
-                    # Emit a compact debug for troubleshooting
-                    self.logger.debug("StakeAdded present but netuid parse failed: evt_keys=%s params_count=%d",
-                                      list(evt.keys()), len(norm_params))
-                    continue
-
-                counts[ev_netuid] = counts.get(ev_netuid, 0) + 1
-            except Exception as e:
-                failed_parse += 1
-                self.logger.debug("StakeAdded parse error: %s", str(e))
+                if ev_netuid is not None:
+                    counts[ev_netuid] = counts.get(ev_netuid, 0) + 1
+            except Exception:
                 continue
 
-        if stakeadded_seen > 0 and sum(counts.values()) == 0:
-            self.logger.debug("StakeAdded seen=%d but no netuid extracted (failed=%d)", stakeadded_seen, failed_parse)
-
         return counts
+
+    def _count_stake_added_by_subnet(self, events) -> Dict[int, int]:
+        """Return {netuid: count} of StakeAdded in provided events (robust parsing across SDK variants)."""
+        return self._count_event_by_subnet(events, {"StakeAdded"})
+
+    def _count_stake_removed_by_subnet(self, events) -> Dict[int, int]:
+        """Return {netuid: count} of StakeRemoved in provided events (for diagnostics)."""
+        return self._count_event_by_subnet(events, {"StakeRemoved"})
 
     def _best_effort_tip_rao(self) -> Optional[int]:
         if self.tip_tao <= 0:
@@ -619,24 +653,104 @@ class AutoStakeBot:
         except Exception:
             return None
 
+    def _get_call_args(self, call_module: str, call_name: str) -> Optional[List[str]]:
+        """Return ordered argument names for a call from runtime metadata."""
+        try:
+            meta = self.substrate_tx.get_metadata_call_function(call_module, call_name)
+            # substrate-interface returns dict with 'args' entries having 'name'
+            args = meta.get("args") or []
+            names: List[str] = []
+            for a in args:
+                n = a.get("name")
+                if isinstance(n, str):
+                    names.append(n)
+            return names if names else None
+        except Exception:
+            return None
+
+    def _build_params_for_call(self, call_module: str, call_name: str, provided: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Build a params dict matching the expected argument names for (pallet.fn) using provided values,
+        trying common synonyms across runtime versions.
+        """
+        expected = self._get_call_args(call_module, call_name)
+        if not expected:
+            # Fall back to provided as-is if metadata is not accessible
+            return provided
+
+        # synonym map per logical field
+        synonyms: Dict[str, List[str]] = {
+            # Stake add amount synonyms
+            "amount": ["amount", "stake", "stake_to_be_added", "stake_to_add", "value"],
+            # Unstake amount synonyms
+            "alpha_unstaked": ["alpha_unstaked", "amount", "unstake_amount", "value"],
+            # Hotkey and netuid are stable but include lowercase variants
+            "hotkey": ["hotkey", "who", "account", "hotKey"],
+            "netuid": ["netuid", "netUid", "net_uid", "subnet_id", "netUidId"],
+        }
+
+        # Inverse lookup from provided keys lowercased
+        provided_lc = {k.lower(): k for k in provided.keys()}
+
+        resolved: Dict[str, Any] = {}
+        for exp in expected:
+            exp_lc = exp.lower()
+            # Direct name match
+            if exp in provided:
+                resolved[exp] = provided[exp]
+                continue
+            if exp_lc in provided_lc:
+                orig = provided_lc[exp_lc]
+                resolved[exp] = provided[orig]
+                continue
+
+            # Try synonyms
+            tried = synonyms.get(exp_lc, [])
+            found = False
+            for syn in tried:
+                syn_lc = syn.lower()
+                if syn in provided:
+                    resolved[exp] = provided[syn]
+                    found = True
+                    break
+                if syn_lc in provided_lc:
+                    orig = provided_lc[syn_lc]
+                    resolved[exp] = provided[orig]
+                    found = True
+                    break
+            if not found:
+                # Cannot satisfy required parameter
+                return None
+
+        return resolved
+
+    def _submit_extrinsic_fast(self, call_module: str, call_function_candidates: List[str], params: Dict[str, Any]) -> Optional[str]:
     def _submit_extrinsic_fast(self, call_module: str, call_function_candidates: List[str], params: Dict[str, Any]) -> Optional[str]:
         """Submit extrinsic via dedicated tx substrate with explicit nonce & tip (no waits)."""
         try:
             call = None
             func_used = None
+            last_err = None
             for func in call_function_candidates:
                 try:
+                    # Build params matching metadata-expected arg names for this call
+                    built = self._build_params_for_call(call_module, func, params)
+                    if not built:
+                        continue
                     call = self.substrate_tx.compose_call(
                         call_module=call_module,
                         call_function=func,
-                        call_params=params
+                        call_params=built
                     )
                     func_used = func
                     break
-                except Exception:
+                except Exception as e_comp:
+                    last_err = e_comp
                     continue
             if call is None:
                 self.logger.debug("Fast mode: no matching function in %s among %s", call_module, call_function_candidates)
+                if last_err:
+                    self.logger.debug("Last compose_call error: %s", str(last_err))
                 return None
 
             nonce = self.nonce_mgr.next_and_increment() if self.nonce_mgr else None
@@ -672,6 +786,19 @@ class AutoStakeBot:
                     self.nonce_mgr.refresh()
             return None
 
+    def _submit_extrinsic_multi(self, module_candidates: List[str], func_candidates: List[str], params: Dict[str, Any]) -> Optional[str]:
+        """Try multiple module and function name variants to compose and submit an extrinsic quickly."""
+        for mod in module_candidates:
+            try:
+                res = self._submit_extrinsic_fast(mod, func_candidates, params)
+                if res:
+                    return res
+            except Exception:
+                # _submit_extrinsic_fast already logs details and nonce handling
+                continue
+        self.logger.debug("No matching extrinsic among modules=%s funcs=%s", module_candidates, func_candidates)
+        return None
+
     def submit_stake(self, netuid: Optional[int] = None) -> bool:
         """Submit stake extrinsic quickly with retries (prefer fast path)."""
         if netuid is None:
@@ -686,27 +813,39 @@ class AutoStakeBot:
         for attempt in range(1, max_retries + 1):
             try:
                 if self.fast_mode:
-                    self.logger.info("Submitting STAKE fast %.8f TAO on subnet %d (attempt %d/%d)", self.stake_amount_tao, netuid, attempt, max_retries)
-                    params = {"hotkey": hot_ss58, "amount": int(amount.rao), "netuid": int(netuid)}
-                    if self._submit_extrinsic_fast("SubtensorModule", ["add_stake", "addStake"], params):
-                        return True
+                    self.logger.info("Submitting STAKE fast %.8f TAO on subnet %s (attempt %d/%d)", self.stake_amount_tao, str(netuid), attempt, max_retries)
+                    modules = [self.call_pallet] if self.call_pallet else ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]
+                    funcs = self.stake_call_candidates
+                    # Param variants across runtime versions
+                    for pv in (
+                        {"hotkey": hot_ss58, "amount": int(amount.rao), "netuid": int(netuid)},
+                        {"hotkey": hot_ss58, "stake_to_be_added": int(amount.rao), "netuid": int(netuid)},
+                    ):
+                        if self._submit_extrinsic_multi(modules, funcs, pv):
+                            return True
                     self.logger.debug("Fast path failed; falling back to SDK path.")
+                    if self.no_sdk_fallback:
+                        self.logger.warning("no_sdk_fallback=true: skipping SDK stake path; will retry fast path only")
+                        time.sleep(min(backoff, max_backoff))
+                        backoff = min(backoff * 2, max_backoff)
+                        continue
 
-                # SDK fallback
-                self.logger.info("Submitting STAKE via SDK %.8f TAO on subnet %d (attempt %d/%d)", self.stake_amount_tao, netuid, attempt, max_retries)
-                success = self.subtensor.add_stake(
-                    wallet=self.wallet,
-                    hotkey_ss58=hot_ss58,
-                    amount=amount,
-                    netuid=netuid,
-                    wait_for_inclusion=self.wait_for_inclusion,
-                    wait_for_finalization=self.wait_for_finalization
-                )
-                if success:
-                    self.logger.info("Stake extrinsic submitted successfully (SDK)")
-                    return True
-                else:
-                    self.logger.warning("Stake extrinsic unsuccessful (SDK) (attempt %d/%d)", attempt, max_retries)
+                # SDK fallback (only if allowed)
+                if not self.no_sdk_fallback:
+                    self.logger.info("Submitting STAKE via SDK %.8f TAO on subnet %d (attempt %d/%d)", self.stake_amount_tao, netuid, attempt, max_retries)
+                    success = self.subtensor.add_stake(
+                        wallet=self.wallet,
+                        hotkey_ss58=hot_ss58,
+                        amount=amount,
+                        netuid=netuid,
+                        wait_for_inclusion=self.wait_for_inclusion,
+                        wait_for_finalization=self.wait_for_finalization
+                    )
+                    if success:
+                        self.logger.info("Stake extrinsic submitted successfully (SDK)")
+                        return True
+                    else:
+                        self.logger.warning("Stake extrinsic unsuccessful (SDK) (attempt %d/%d)", attempt, max_retries)
             except Exception as e:
                 self.logger.warning("Stake submit error: %s", str(e))
                 if self.nonce_mgr:
@@ -733,27 +872,38 @@ class AutoStakeBot:
         for attempt in range(1, max_retries + 1):
             try:
                 if self.fast_mode:
-                    self.logger.info("Submitting UNSTAKE fast %.8f TAO on subnet %d (attempt %d/%d)", self.stake_amount_tao, netuid, attempt, max_retries)
-                    params = {"hotkey": hot_ss58, "amount": int(amount.rao), "netuid": int(netuid)}
-                    if self._submit_extrinsic_fast("SubtensorModule", ["remove_stake", "removeStake"], params):
-                        return True
+                    self.logger.info("Submitting UNSTAKE fast %.8f TAO on subnet %s (attempt %d/%d)", self.stake_amount_tao, str(netuid), attempt, max_retries)
+                    modules = [self.call_pallet] if self.call_pallet else ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]
+                    funcs = self.unstake_call_candidates
+                    for pv in (
+                        {"hotkey": hot_ss58, "alpha_unstaked": int(amount.rao), "netuid": int(netuid)},
+                        {"hotkey": hot_ss58, "amount": int(amount.rao), "netuid": int(netuid)},
+                    ):
+                        if self._submit_extrinsic_multi(modules, funcs, pv):
+                            return True
                     self.logger.debug("Fast path failed; falling back to SDK path.")
+                    if self.no_sdk_fallback:
+                        self.logger.warning("no_sdk_fallback=true: skipping SDK unstake path; will retry fast path only")
+                        time.sleep(min(backoff, max_backoff))
+                        backoff = min(backoff * 2, max_backoff)
+                        continue
 
-                # SDK fallback
-                self.logger.info("Submitting UNSTAKE via SDK %.8f TAO on subnet %d (attempt %d/%d)", self.stake_amount_tao, netuid, attempt, max_retries)
-                success = self.subtensor.unstake(
-                    wallet=self.wallet,
-                    hotkey_ss58=hot_ss58,
-                    amount=amount,
-                    netuid=netuid,
-                    wait_for_inclusion=self.wait_for_inclusion,
-                    wait_for_finalization=self.wait_for_finalization
-                )
-                if success:
-                    self.logger.info("Unstake extrinsic submitted successfully (SDK)")
-                    return True
-                else:
-                    self.logger.warning("Unstake extrinsic unsuccessful (SDK) (attempt %d/%d)", attempt, max_retries)
+                # SDK fallback (only if allowed)
+                if not self.no_sdk_fallback:
+                    self.logger.info("Submitting UNSTAKE via SDK %.8f TAO on subnet %d (attempt %d/%d)", self.stake_amount_tao, netuid, attempt, max_retries)
+                    success = self.subtensor.unstake(
+                        wallet=self.wallet,
+                        hotkey_ss58=hot_ss58,
+                        amount=amount,
+                        netuid=netuid,
+                        wait_for_inclusion=self.wait_for_inclusion,
+                        wait_for_finalization=self.wait_for_finalization
+                    )
+                    if success:
+                        self.logger.info("Unstake extrinsic submitted successfully (SDK)")
+                        return True
+                    else:
+                        self.logger.warning("Unstake extrinsic unsuccessful (SDK) (attempt %d/%d)", attempt, max_retries)
             except Exception as e:
                 self.logger.warning("Unstake submit error: %s", str(e))
                 if self.nonce_mgr:
@@ -773,18 +923,23 @@ class AutoStakeBot:
             # Export raw events to JSON per block if enabled
             if self.export_events:
                 self._export_block_events(block_number, events)
-            counts = self._count_stake_added_by_subnet(events)
-            if not counts:
+
+            # Count StakeAdded (trigger) and StakeRemoved (diagnostics)
+            counts_added = self._count_stake_added_by_subnet(events)
+            counts_removed = self._count_stake_removed_by_subnet(events)
+            if counts_removed:
+                self.logger.debug("Block %d: StakeRemoved per subnet = %s", block_number, counts_removed)
+
+            if not counts_added:
                 self.logger.debug("Block %d: no StakeAdded events", block_number)
                 return
 
             # Determine which subnets to consider based on mode
             candidate_netuids: List[int] = []
             if self.subnet_mode == "any":
-                candidate_netuids = [n for n, c in counts.items() if c >= 2]
+                candidate_netuids = [n for n, c in counts_added.items() if c >= 2]
             else:
-                # single mode
-                if counts.get(self.subnet_id, 0) >= 2:
+                if counts_added.get(self.subnet_id, 0) >= 2:
                     candidate_netuids = [self.subnet_id]
 
             for netuid in candidate_netuids:
@@ -798,7 +953,7 @@ class AutoStakeBot:
                     continue
 
                 self.logger.info("Trigger condition met at block %d: >=2 StakeAdded on subnet %d (count=%d)",
-                                 block_number, netuid, counts.get(netuid, 0))
+                                 block_number, netuid, counts_added.get(netuid, 0))
                 self.trigger_stake(block_number, netuid)
         except Exception as e:
             self.logger.warning("analyze_block error for block %d: %s", block_number, str(e))
@@ -930,36 +1085,22 @@ class AutoStakeBot:
                         self.analyze_block(block_number)
 
                 else:
-                    self.logger.info("Subscribing to new block headers (iterator mode or polling fallback)...")
-                    # Iterator attempt
-                    try:
-                        for header in self.substrate.subscribe_block_headers():
-                            if self._shutdown:
-                                break
-                            block_number = self._parse_block_number(header)
-                            if block_number is None:
-                                continue
-                            self.last_analyzed_block = block_number
-                            self.logger.debug("New block: %d", block_number)
-                            self.execute_unstake(block_number)
-                            self.analyze_block(block_number)
-                    except TypeError:
-                        # Poll fallback
-                        self.logger.info("Iterator mode not supported; falling back to polling current block...")
-                        last_seen: Optional[int] = None
-                        while not self._shutdown:
-                            try:
-                                current = self.subtensor.get_current_block()
-                                if last_seen is None or current > last_seen:
-                                    last_seen = current
-                                    self.last_analyzed_block = current
-                                    self.logger.debug("New block (poll): %d", current)
-                                    self.execute_unstake(current)
-                                    self.analyze_block(current)
-                                time.sleep(self.poll_interval)
-                            except Exception as pe:
-                                self.logger.warning("Polling error: %s", str(pe))
-                                break
+                    # Always poll when callback mode is unavailable on this substrate-interface version
+                    self.logger.info("Polling current block (subscription iterator unsupported on this runtime)...")
+                    last_seen: Optional[int] = None
+                    while not self._shutdown:
+                        try:
+                            current = self.subtensor.get_current_block()
+                            if last_seen is None or current > last_seen:
+                                last_seen = current
+                                self.last_analyzed_block = current
+                                self.logger.debug("New block (poll): %d", current)
+                                self.execute_unstake(current)
+                                self.analyze_block(current)
+                            time.sleep(self.poll_interval)
+                        except Exception as pe:
+                            self.logger.warning("Polling error: %s", str(pe))
+                            break
 
                 if not self._shutdown:
                     time.sleep(0.05)
