@@ -1,34 +1,46 @@
 #!/usr/bin/env python3
 """
-Bittensor Automated Event-Driven Staking Bot (Production-optimized)
+Bittensor Automated Event-Driven Staking Bot (WS-first, Production-optimized)
 
 Objective:
-- Monitor every new block via websocket
-- For each block, count StakeAdded events on the target subnet (default: 63)
-- If count >= 2 in block N -> immediately submit stake extrinsic (best-effort same block, realistically N+1)
-- On block N+1 -> automatically submit unstake extrinsic
-- Repeat whenever the trigger condition is met
+- Monitor every new block with minimal latency
+- Count StakeAdded events on the target subnet per block
+- If count >= 2 for block N -> submit stake ASAP (best-effort N/N+1)
+- Schedule unstake for N+1 and execute promptly
+- Repeat reliably with robust reconnects, concurrency, and fallbacks
+
+Key Architecture:
+- Websocket-first:
+  - Subscribe to new heads (best effort earliest visibility)
+  - Optional: Subscribe to System.Events (storage) when available
+- Separate websocket clients:
+  - Client A: headers
+  - Client B: events (optional)
+  - Client C: extrinsics
+- Fallbacks:
+  - Iterator mode headers
+  - Polling get_current_block at low latency
+- Nonce/priority:
+  - Explicit NonceManager (optimistic increment, refresh on mismatch)
+  - Optional tip for priority
+  - No waits on inclusion/finality (fast path)
 
 Run:
     python stake_bot.py
 
 Config:
-    Edit config.yaml (auto-created on first run) to set:
-      - wallet_name, hotkey_name
-      - stake_amount (TAO)
-      - subnet_id (default 63)
-      - network ("finney" mainnet or "test")
-      - logging options
-      - retry/backoff options
-      - fast_mode, tip_tao, persist_state, state_file
-
-Technical Notes:
-- Uses Bittensor SDK for wallet and extrinsics
-- Uses Substrate websocket subscription for low-latency block monitoring
-- Nonce/priority/timeout errors are retried with backoff
-- Zero-wait submits by default (no inclusion/finalization waits)
-- Optional fast path: direct extrinsic composition with explicit nonce & tip
-- Persists state to survive restarts (pending unstake)
+    config.yaml is created on first run. Edit:
+    - network
+    - optional chain_endpoint (single) or leave empty to use defaults
+    - wallet_name, hotkey_name, wallet_password
+    - target_hotkey (validator hotkey SS58 on target subnet) or leave empty to stake to your own hotkey
+    - stake_amount (TAO), subnet_id
+    - fast_mode, tip_tao, wait_for_inclusion/finalization
+    - subscription_mode: auto | callback | poll
+    - header_wait_timeout_seconds
+    - poll_interval_seconds
+    - log_level, log_to_file, log_file
+    - persist_state, state_file
 """
 
 import os
@@ -38,16 +50,12 @@ import json
 import signal
 import logging
 from logging.handlers import RotatingFileHandler
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import inspect
 import queue
 import threading
 
 import bittensor as bt
-try:
-    from bittensor.wallet import Wallet as WalletCls  # newer SDK path
-except Exception:
-    WalletCls = None
 
 # Optional YAML dependency with minimal fallback parser
 try:
@@ -58,23 +66,27 @@ except Exception:
 
 
 DEFAULT_CONFIG = {
-    "network": "finney",                # "finney" (mainnet) or "test"
+    # Network and optional endpoint
+    "network": "finney",                 # "finney" (mainnet) or "test"
+    "chain_endpoint": "",                # optional ws endpoint (wss://host:port). Leave empty to use defaults
+
+    # Wallet & accounting
     "wallet_name": "default",
     "hotkey_name": "default",
-    "wallet_password": "",
-    "target_hotkey": "",                # optional: stake to this hotkey (validator) if set; otherwise use your wallet's hotkey
-    "stake_amount": 0.05,               # TAO
-    "subnet_id": 63,                    # default target subnet
+    "wallet_password": "",               # optional: set to avoid repeated prompt per run
+    "target_hotkey": "",                 # optional: stake to this hotkey (validator) if set; otherwise your wallet's hotkey
+    "stake_amount": 0.05,                # TAO
+    "subnet_id": 63,                     # default target subnet
 
     # Performance & behavior
-    "fast_mode": True,                  # Use explicit nonce & tip via substrate-interface when possible
-    "tip_tao": 0.0,                     # optional tip to improve priority
-    "wait_for_inclusion": False,        # defaults tuned for SPEED
-    "wait_for_finalization": False,
+    "fast_mode": True,                   # explicit nonce & tip, zero-wait extrinsics
+    "tip_tao": 0.0,                      # optional tip to improve priority
+    "wait_for_inclusion": False,         # False = faster, True = wait for inclusion
+    "wait_for_finalization": False,      # False = fastest, True = wait for finalization
 
     # Retries/backoff
     "max_retries": 5,
-    "retry_backoff_seconds": 0.5,       # starting backoff
+    "retry_backoff_seconds": 0.5,        # starting backoff
     "max_backoff_seconds": 4.0,
 
     # Websocket reconnects
@@ -82,11 +94,12 @@ DEFAULT_CONFIG = {
     "ws_reconnect_max_backoff_seconds": 8.0,
 
     # Subscription strategy
-    "subscription_mode": "auto",        # auto | callback | poll
-    "header_wait_timeout_seconds": 15.0,
+    "subscription_mode": "auto",         # auto | callback | poll
+    "header_wait_timeout_seconds": 3.0,  # fallback if no headers in this time (since ~12s blocks, 2-3s is aggressive)
+    "poll_interval_seconds": 0.5,        # polling interval when in poll mode
 
     # Logging
-    "log_level": "INFO",                # DEBUG | INFO | WARNING | ERROR
+    "log_level": "INFO",                 # DEBUG | INFO | WARNING | ERROR
     "log_to_file": True,
     "log_file": "stake_bot.log",
 
@@ -95,17 +108,13 @@ DEFAULT_CONFIG = {
     "state_file": "stake_state.json",
 
     # Trigger safety
-    "allow_overlap_triggers": False     # if False: don't trigger a new stake while an unstake is pending
+    "allow_overlap_triggers": False      # if False: don't trigger stake while an unstake is pending
 }
 
 CONFIG_PATH = os.environ.get("STAKE_BOT_CONFIG", "config.yaml")
 
 
 def _simple_parse_yaml(path: str) -> Dict[str, Any]:
-    """
-    Minimal YAML parser for simple 'key: value' pairs (booleans/numbers/strings).
-    Used only when PyYAML is unavailable to avoid extra dependency.
-    """
     data: Dict[str, Any] = {}
     try:
         with open(path, "r") as f:
@@ -118,15 +127,12 @@ def _simple_parse_yaml(path: str) -> Dict[str, Any]:
                 key, val = line.split(":", 1)
                 key = key.strip()
                 val = val.strip()
-                # Strip end-of-line comments
                 if " #" in val:
                     val = val.split(" #", 1)[0].strip()
-                # Convert booleans
                 low = val.lower()
                 if low in ("true", "false"):
                     data[key] = (low == "true")
                     continue
-                # Convert numbers
                 try:
                     if "." in val:
                         data[key] = float(val)
@@ -135,7 +141,6 @@ def _simple_parse_yaml(path: str) -> Dict[str, Any]:
                     continue
                 except Exception:
                     pass
-                # Strip quotes
                 if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
                     val = val[1:-1]
                 data[key] = val
@@ -145,7 +150,6 @@ def _simple_parse_yaml(path: str) -> Dict[str, Any]:
 
 
 def _simple_dump_yaml(path: str, obj: Dict[str, Any]) -> None:
-    """Write a minimal YAML file with simple key: value pairs."""
     lines = [
         "# Event-Driven Staking Bot Configuration",
         "# Edit values as needed. This file is read at startup by stake_bot.py",
@@ -196,8 +200,7 @@ class NonceManager:
         self._cached = None
 
 
-# Global bot instance is created in main() so module-level functions can delegate to it.
-BOT = None
+BOT = None  # Global so module-level functions can delegate
 
 
 class AutoStakeBot:
@@ -206,7 +209,10 @@ class AutoStakeBot:
         self._setup_logging()
         self.logger = logging.getLogger("stake_bot")
 
+        # Config
         self.network = self.cfg["network"]
+        self.chain_endpoint = str(self.cfg.get("chain_endpoint", "")).strip()
+
         self.wallet_name = self.cfg["wallet_name"]
         self.hotkey_name = self.cfg["hotkey_name"]
         self.target_hotkey = str(self.cfg.get("target_hotkey", "")).strip()
@@ -218,23 +224,29 @@ class AutoStakeBot:
         self.wait_for_inclusion = bool(self.cfg.get("wait_for_inclusion", False))
         self.wait_for_finalization = bool(self.cfg.get("wait_for_finalization", False))
 
-        self.subtensor: Optional[bt.Subtensor] = None
+        self.subscription_mode = str(self.cfg.get("subscription_mode", "auto")).lower()
+        self.header_timeout = float(self.cfg.get("header_wait_timeout_seconds", 3.0))
+        self.poll_interval = float(self.cfg.get("poll_interval_seconds", 0.5))
+
+        # Clients
+        self.subtensor: Optional[bt.Subtensor] = None         # primary client (headers)
         self.substrate = None
-        # Dedicated client for event queries to avoid websocket recv conflicts with subscription thread
-        self.events_subtensor: Optional[bt.Subtensor] = None
+        self.events_subtensor: Optional[bt.Subtensor] = None  # dedicated events client
         self.substrate_events = None
+        self.tx_subtensor: Optional[bt.Subtensor] = None      # dedicated extrinsic client
+        self.substrate_tx = None
+
+        # Wallet & Nonce
         self.wallet: Optional[Any] = None
         self.nonce_mgr: Optional[NonceManager] = None
 
-        # State for trigger/unstake coordination
+        # State (trigger/unstake coordination)
         self.last_analyzed_block: Optional[int] = None
         self.last_staked_block: Optional[int] = None
         self.pending_unstake_block: Optional[int] = None
-        self._shutdown = False
 
-        # persistence
-        self.persist_state = bool(self.cfg.get("persist_state", True))
-        self.state_file = str(self.cfg.get("state_file", "stake_state.json"))
+        # Concurrency/threading
+        self._shutdown = False
 
     def _setup_logging(self):
         level = getattr(logging, str(self.cfg.get("log_level", "INFO")).upper(), logging.INFO)
@@ -253,35 +265,12 @@ class AutoStakeBot:
             handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
             logging.getLogger().addHandler(handler)
 
-    def _create_wallet(self):
-        """
-        Create a Bittensor wallet object compatible across SDK versions.
-        Tries:
-          1) WalletCls from bittensor.wallet (newer SDKs)
-          2) bt.wallet(name=..., hotkey=...) (older SDKs)
-        """
-        # Newer SDK
-        if 'WalletCls' in globals() and WalletCls is not None:
-            try:
-                return WalletCls(name=self.wallet_name, hotkey=self.hotkey_name)
-            except Exception as e:
-                self.logger.debug("WalletCls init failed: %s", e)
-
-        # Older SDK: function-style factory on bittensor module
-        try:
-            if hasattr(bt, "wallet") and callable(getattr(bt, "wallet")):
-                return bt.wallet(name=self.wallet_name, hotkey=self.hotkey_name)
-        except Exception as e:
-            self.logger.debug("bt.wallet init failed: %s", e)
-
-        raise RuntimeError("Bittensor Wallet API not found. Install compatible bittensor in this venv, e.g.: pip install 'bittensor==9.15.3'")
-
     def _load_state(self):
-        if not self.persist_state:
+        if not self.cfg.get("persist_state", True):
             return
         try:
-            if os.path.exists(self.state_file):
-                with open(self.state_file, "r") as f:
+            if os.path.exists(self.cfg.get("state_file", "stake_state.json")):
+                with open(self.cfg.get("state_file", "stake_state.json"), "r") as f:
                     s = json.load(f)
                 self.last_staked_block = s.get("last_staked_block")
                 self.pending_unstake_block = s.get("pending_unstake_block")
@@ -291,25 +280,39 @@ class AutoStakeBot:
             self.logger.warning("Failed to load state: %s", str(e))
 
     def _save_state(self):
-        if not self.persist_state:
+        if not self.cfg.get("persist_state", True):
             return
         try:
             s = {
                 "last_staked_block": self.last_staked_block,
                 "pending_unstake_block": self.pending_unstake_block
             }
-            with open(self.state_file, "w") as f:
+            with open(self.cfg.get("state_file", "stake_state.json"), "w") as f:
                 json.dump(s, f)
         except Exception as e:
             self.logger.warning("Failed to save state: %s", str(e))
 
+    def _new_subtensor(self) -> bt.Subtensor:
+        if self.chain_endpoint:
+            return bt.Subtensor(network=self.network, chain_endpoint=self.chain_endpoint)
+        return bt.Subtensor(network=self.network)
+
     def initialize(self):
         self.logger.info("Initializing wallet and network connection...")
-        # Wallet (SDK-compatible creation)
-        self.wallet = self._create_wallet()
+
+        # Wallet creation
+        # Compatible across SDK versions: prefer factory on bt
+        wallet_factory = getattr(bt, "wallet", None)
+        if callable(wallet_factory):
+            self.wallet = wallet_factory(name=self.wallet_name, hotkey=self.hotkey_name)
+        else:
+            # Best-effort fallback
+            from bittensor.wallet import Wallet as WalletCls  # may fail on older SDKs
+            self.wallet = WalletCls(name=self.wallet_name, hotkey=self.hotkey_name)
+
         self.wallet.create_if_non_existent()
 
-        # Unlock coldkey once per process (supports config/env), prompt only once if needed
+        # Unlock once per process
         try:
             pw = str(self.cfg.get("wallet_password", "")).strip()
             if pw:
@@ -317,7 +320,7 @@ class AutoStakeBot:
             try:
                 self.wallet.unlock_coldkey()
                 self.logger.info("Wallet unlocked")
-            except Exception as e1:
+            except Exception:
                 import getpass
                 self.logger.info("Wallet unlock needs password; prompting once...")
                 pw_input = getpass.getpass("Wallet password: ")
@@ -326,51 +329,57 @@ class AutoStakeBot:
                 self.wallet.unlock_coldkey()
                 self.logger.info("Wallet unlocked")
         except Exception as e:
-            # Wallet may be unencrypted or already unlocked
             self.logger.info("Wallet loaded (unencrypted or already unlocked): %s", str(e))
 
-        # Subtensor / network connect
-        self.subtensor = bt.Subtensor(network=self.network)
-        # Underlying substrate client (websocket)
+        # Clients
+        if self.chain_endpoint:
+            self.logger.info("Using custom chain endpoint: %s", self.chain_endpoint)
+        self.subtensor = self._new_subtensor()
         self.substrate = self.subtensor.substrate
-        # Separate substrate for event queries to avoid 'recv already running' conflicts
+
+        # Separate events client
         try:
-            self.events_subtensor = bt.Subtensor(network=self.network)
+            self.events_subtensor = self._new_subtensor()
             self.substrate_events = self.events_subtensor.substrate
         except Exception as e:
             self.logger.warning("Failed to initialize separate events substrate: %s", str(e))
             self.substrate_events = self.substrate
+
+        # Separate extrinsic client
+        try:
+            self.tx_subtensor = self._new_subtensor()
+            self.substrate_tx = self.tx_subtensor.substrate
+        except Exception as e:
+            self.logger.warning("Failed to initialize separate tx substrate: %s", str(e))
+            self.substrate_tx = self.substrate
+
         self.logger.info("Connected to network: %s", self.network)
 
-        # Nonce manager for the signer (coldkey is the payer)
+        # Nonce manager (signer is coldkey)
         signer_ss58 = self.wallet.coldkeypub.ss58_address
-        self.nonce_mgr = NonceManager(self.substrate, signer_ss58, self.logger)
+        self.nonce_mgr = NonceManager(self.substrate_tx, signer_ss58, self.logger)
 
-        # Basic wallet info
-        cold_ss58 = self.wallet.coldkeypub.ss58_address
-        hot_ss58 = self.wallet.hotkey.ss58_address
-        bal = self.subtensor.get_balance(cold_ss58)
-        self.logger.info("Coldkey: %s | Hotkey: %s | Balance: %s TAO", cold_ss58, hot_ss58, bal.tao)
-
+        # Balance check
+        bal = self.subtensor.get_balance(signer_ss58)
+        self.logger.info("Coldkey: %s | Hotkey: %s | Balance: %s TAO",
+                         signer_ss58, self.wallet.hotkey.ss58_address, bal.tao)
         if bal.tao < self.stake_amount_tao:
             raise RuntimeError(f"Insufficient balance {bal.tao} < required {self.stake_amount_tao} TAO")
 
-        # Restore persisted state if any
+        # Load persisted schedule
         self._load_state()
 
     def _ensure_events_client(self):
-        """Ensure a dedicated events substrate client exists (separate websocket)."""
         if self.substrate_events is None:
             try:
-                self.events_subtensor = bt.Subtensor(network=self.network)
+                self.events_subtensor = self._new_subtensor()
                 self.substrate_events = self.events_subtensor.substrate
             except Exception as e:
                 self.logger.warning("Recreating events substrate failed: %s", str(e))
                 self.substrate_events = self.substrate
 
     def _events_for_block(self, block_number: int):
-        """Fetch events for a given block number. Returns list of event records, or []"""
-        # Always use the dedicated events substrate to avoid recv conflict with subscription thread
+        """Fetch events for a given block via dedicated events client. Returns list or []"""
         self._ensure_events_client()
         try:
             block_hash = self.substrate_events.get_block_hash(block_number)
@@ -380,12 +389,10 @@ class AutoStakeBot:
             return events or []
         except Exception as e:
             es = str(e)
-            # Handle recv conflicts by recreating the events substrate and retrying once
             if "cannot call recv while another thread is already running recv" in es or "recv_streaming" in es:
                 self.logger.warning("Events client recv conflict; recreating events substrate and retrying...")
                 try:
-                    # Recreate client
-                    self.events_subtensor = bt.Subtensor(network=self.network)
+                    self.events_subtensor = self._new_subtensor()
                     self.substrate_events = self.events_subtensor.substrate
                     block_hash = self.substrate_events.get_block_hash(block_number)
                     if block_hash is None:
@@ -399,18 +406,13 @@ class AutoStakeBot:
             return []
 
     def _count_stake_added_for_subnet(self, events, target_subnet: int) -> int:
-        """Count events that look like StakeAdded on target subnet."""
+        """Count StakeAdded for target subnet across possible naming variants."""
         count = 0
-
-        # Known variations of event naming
-        accepted_event_ids = {
-            "StakeAdded", "StakeIncrease", "StakeIncreased", "AddStake"
-        }
+        accepted_event_ids = {"StakeAdded"}  # canonical
         accepted_modules = {"SubtensorModule", "Subtensor"}  # pallet naming variants
 
-        for ev in events:
+        for ev in events or []:
             try:
-                # substrate-interface yields EventRecord with .value dict
                 evval = ev.value if hasattr(ev, "value") else ev
                 evt = evval.get("event", {})
                 module_id = evt.get("module_id") or evt.get("pallet") or ""
@@ -419,35 +421,25 @@ class AutoStakeBot:
                 if module_id not in accepted_modules or event_id not in accepted_event_ids:
                     continue
 
-                # params may be under "attributes" or "params"
                 params = evt.get("attributes") or evt.get("params") or []
-                # Normalize to list of dicts with name/value
-                parsed_params = []
+                ev_netuid = None
                 for p in params:
                     if isinstance(p, dict):
-                        parsed_params.append(p)
-                    else:
-                        parsed_params.append({"name": "", "value": p})
-
-                ev_netuid = None
-                for p in parsed_params:
-                    name = (p.get("name") or "").lower()
-                    if name == "netuid":
-                        try:
+                        name = (p.get("name") or "").lower()
+                        if name == "netuid":
+                            try:
+                                ev_netuid = int(p.get("value"))
+                            except Exception:
+                                pass
+                            break
+                        # fallback heuristic
+                        if ev_netuid is None and isinstance(p.get("value"), int):
                             ev_netuid = int(p.get("value"))
-                        except Exception:
-                            pass
-                        break
-                    if ev_netuid is None and isinstance(p.get("value"), int):
-                        ev_netuid = int(p.get("value"))
-
                 if ev_netuid is None:
                     continue
-
                 if ev_netuid == target_subnet:
                     count += 1
-            except Exception as e:
-                self.logger.debug("Error parsing event: %s", str(e))
+            except Exception:
                 continue
 
         return count
@@ -460,27 +452,15 @@ class AutoStakeBot:
         except Exception:
             return None
 
-    def _resolve_call_name(self, pallet: str, candidates: List[str]) -> Optional[str]:
-        for name in candidates:
-            try:
-                # probe by attempting to load metadata for the function
-                _ = self.substrate.get_metadata_call_function(pallet, name)
-                return name
-            except Exception:
-                continue
-        return None
-
     def _submit_extrinsic_fast(self, call_module: str, call_function_candidates: List[str], params: Dict[str, Any]) -> Optional[str]:
-        """
-        Compose and submit extrinsic with explicit nonce & tip, without waiting.
-        Returns tx hash on (apparent) success or None on failure.
-        """
+        """Submit extrinsic via dedicated tx substrate with explicit nonce & tip (no waits)."""
         try:
-            func_used = None
+            # Compose call by trying candidate function names
             call = None
+            func_used = None
             for func in call_function_candidates:
                 try:
-                    call = self.substrate.compose_call(
+                    call = self.substrate_tx.compose_call(
                         call_module=call_module,
                         call_function=func,
                         call_params=params
@@ -489,23 +469,20 @@ class AutoStakeBot:
                     break
                 except Exception:
                     continue
-
             if call is None:
                 self.logger.debug("Fast mode: no matching function in %s among %s", call_module, call_function_candidates)
                 return None
 
-            # Explicit nonce & tip
             nonce = self.nonce_mgr.next_and_increment() if self.nonce_mgr else None
             tip_rao = self._best_effort_tip_rao()
 
-            extrinsic = self.substrate.create_signed_extrinsic(
+            extrinsic = self.substrate_tx.create_signed_extrinsic(
                 call=call,
                 keypair=self.wallet.coldkey,
                 tip=tip_rao if tip_rao is not None else 0,
                 nonce=nonce
             )
-
-            tx_hash = self.substrate.submit_extrinsic(
+            tx_hash = self.substrate_tx.submit_extrinsic(
                 extrinsic=extrinsic,
                 wait_for_inclusion=self.wait_for_inclusion,
                 wait_for_finalization=self.wait_for_finalization
@@ -523,16 +500,16 @@ class AutoStakeBot:
         except Exception as e:
             es = str(e)
             self.logger.warning("Fast submit error: %s", es)
-            if "Priority is too low" in es or "Future" in es or "Stale" in es or "Old" in es:
+            if any(x in es for x in ("Priority is too low", "Future", "Stale", "Old")):
                 if self.nonce_mgr:
                     self.nonce_mgr.invalidate()
                     self.nonce_mgr.refresh()
             return None
 
     def submit_stake(self) -> bool:
-        """Submit stake extrinsic quickly with retries, prefer fast mode."""
+        """Submit stake extrinsic quickly with retries (prefer fast path)."""
         amount = bt.Balance.from_tao(self.stake_amount_tao)
-        hot_ss58 = self.target_hotkey if getattr(self, "target_hotkey", "") else self.wallet.hotkey.ss58_address
+        hot_ss58 = self.target_hotkey if self.target_hotkey else self.wallet.hotkey.ss58_address
         netuid = self.subnet_id
 
         max_retries = int(self.cfg["max_retries"])
@@ -543,21 +520,12 @@ class AutoStakeBot:
             try:
                 if self.fast_mode:
                     self.logger.info("Submitting STAKE fast %.8f TAO on subnet %d (attempt %d/%d)", self.stake_amount_tao, netuid, attempt, max_retries)
-                    params = {
-                        "hotkey": hot_ss58,
-                        "amount": int(amount.rao),
-                        "netuid": int(netuid),
-                    }
-                    txh = self._submit_extrinsic_fast(
-                        call_module="SubtensorModule",
-                        call_function_candidates=["add_stake", "addStake"],
-                        params=params
-                    )
-                    if txh:
+                    params = {"hotkey": hot_ss58, "amount": int(amount.rao), "netuid": int(netuid)}
+                    if self._submit_extrinsic_fast("SubtensorModule", ["add_stake", "addStake"], params):
                         return True
-                    self.logger.debug("Fast path failed; falling back to Subtensor.add_stake()")
+                    self.logger.debug("Fast path failed; falling back to SDK path.")
 
-                # Fallback to SDK path
+                # SDK fallback
                 self.logger.info("Submitting STAKE via SDK %.8f TAO on subnet %d (attempt %d/%d)", self.stake_amount_tao, netuid, attempt, max_retries)
                 success = self.subtensor.add_stake(
                     wallet=self.wallet,
@@ -571,10 +539,9 @@ class AutoStakeBot:
                     self.logger.info("Stake extrinsic submitted successfully (SDK)")
                     return True
                 else:
-                    self.logger.warning("Stake extrinsic returned unsuccessful (SDK) (attempt %d/%d)", attempt, max_retries)
+                    self.logger.warning("Stake extrinsic unsuccessful (SDK) (attempt %d/%d)", attempt, max_retries)
             except Exception as e:
-                es = str(e)
-                self.logger.warning("Stake submit error: %s", es)
+                self.logger.warning("Stake submit error: %s", str(e))
                 if self.nonce_mgr:
                     self.nonce_mgr.invalidate()
 
@@ -586,9 +553,9 @@ class AutoStakeBot:
         return False
 
     def submit_unstake(self) -> bool:
-        """Submit unstake extrinsic quickly with retries, prefer fast mode."""
+        """Submit unstake extrinsic quickly with retries (prefer fast path)."""
         amount = bt.Balance.from_tao(self.stake_amount_tao)
-        hot_ss58 = self.target_hotkey if getattr(self, "target_hotkey", "") else self.wallet.hotkey.ss58_address
+        hot_ss58 = self.target_hotkey if self.target_hotkey else self.wallet.hotkey.ss58_address
         netuid = self.subnet_id
 
         max_retries = int(self.cfg["max_retries"])
@@ -599,21 +566,12 @@ class AutoStakeBot:
             try:
                 if self.fast_mode:
                     self.logger.info("Submitting UNSTAKE fast %.8f TAO on subnet %d (attempt %d/%d)", self.stake_amount_tao, netuid, attempt, max_retries)
-                    params = {
-                        "hotkey": hot_ss58,
-                        "amount": int(amount.rao),
-                        "netuid": int(netuid),
-                    }
-                    txh = self._submit_extrinsic_fast(
-                        call_module="SubtensorModule",
-                        call_function_candidates=["remove_stake", "removeStake"],
-                        params=params
-                    )
-                    if txh:
+                    params = {"hotkey": hot_ss58, "amount": int(amount.rao), "netuid": int(netuid)}
+                    if self._submit_extrinsic_fast("SubtensorModule", ["remove_stake", "removeStake"], params):
                         return True
-                    self.logger.debug("Fast path failed; falling back to Subtensor.unstake()")
+                    self.logger.debug("Fast path failed; falling back to SDK path.")
 
-                # Fallback to SDK path
+                # SDK fallback
                 self.logger.info("Submitting UNSTAKE via SDK %.8f TAO on subnet %d (attempt %d/%d)", self.stake_amount_tao, netuid, attempt, max_retries)
                 success = self.subtensor.unstake(
                     wallet=self.wallet,
@@ -627,10 +585,9 @@ class AutoStakeBot:
                     self.logger.info("Unstake extrinsic submitted successfully (SDK)")
                     return True
                 else:
-                    self.logger.warning("Unstake extrinsic returned unsuccessful (SDK) (attempt %d/%d)", attempt, max_retries)
+                    self.logger.warning("Unstake extrinsic unsuccessful (SDK) (attempt %d/%d)", attempt, max_retries)
             except Exception as e:
-                es = str(e)
-                self.logger.warning("Unstake submit error: %s", es)
+                self.logger.warning("Unstake submit error: %s", str(e))
                 if self.nonce_mgr:
                     self.nonce_mgr.invalidate()
 
@@ -644,9 +601,7 @@ class AutoStakeBot:
     def analyze_block(self, block_number: int):
         """Fetch events for block_number, count stakes for target subnet, trigger stake if count >= 2."""
         try:
-            # Optional: prevent overlap triggers if unstake is pending
             if not self.cfg.get("allow_overlap_triggers", False) and self.pending_unstake_block is not None:
-                # Avoid stacking positions before previous unstake executes
                 self.logger.debug("Unstake pending for block %s; skip trigger at block %s",
                                   self.pending_unstake_block, block_number)
                 return
@@ -656,11 +611,9 @@ class AutoStakeBot:
             self.logger.debug("Block %d: StakeAdded count on subnet %d = %d", block_number, self.subnet_id, count)
 
             if count >= 2:
-                # Ensure we don't double-trigger on same block
                 if self.last_staked_block == block_number:
                     self.logger.debug("Already staked on block %d; skipping", block_number)
                     return
-
                 self.logger.info("Trigger condition met at block %d: >=2 StakeAdded on subnet %d", block_number, self.subnet_id)
                 self.trigger_stake(block_number)
         except Exception as e:
@@ -676,59 +629,62 @@ class AutoStakeBot:
             self.logger.info("Scheduled UNSTAKE at block %d", self.pending_unstake_block)
 
     def execute_unstake(self, current_block: int):
-        """If pending_unstake_block == current_block (or already passed), submit unstake."""
+        """If pending_unstake_block == current_block (or passed), submit unstake."""
         if self.pending_unstake_block is None:
             return
-
-        # If we somehow missed the exact block, execute as soon as possible
         if current_block >= self.pending_unstake_block:
             self.logger.info("Unstake due at block %d (scheduled: %d)", current_block, self.pending_unstake_block)
             ok = self.submit_unstake()
             if ok:
-                # Clear pending after successful submission
                 self.pending_unstake_block = None
                 self._save_state()
             else:
-                # If unstake failed, keep pending and retry on next block
                 self.logger.warning("Unstake submission failed; will retry on next block")
 
+    def _header_subscription_loop(self, handler, q: "queue.Queue[Any]", sub_exc: Dict[str, Any]):
+        """Background thread function: subscribe_block_headers(handler)."""
+        try:
+            self.substrate.subscribe_block_headers(handler)
+        except Exception as e:
+            sub_exc["err"] = e
+            try:
+                q.put_nowait({"__error__": str(e)})
+            except Exception:
+                pass
+
+    def _parse_block_number(self, header_obj: Any) -> Optional[int]:
+        try:
+            number = header_obj["header"]["number"]
+            return int(number, 16) if isinstance(number, str) else int(number)
+        except Exception:
+            try:
+                number = header_obj.get("number", header_obj.get("block", {}).get("header", {}).get("number"))
+                return int(number, 16) if isinstance(number, str) else int(number)
+            except Exception:
+                return None
+
     def monitor_blocks(self):
-        """Continuous monitoring of new blocks with subscription-callback if available, otherwise iterator or polling fallback."""
+        """Continuous monitoring: callback (preferred) or fallback to iterator/poll, with reconnects."""
         self.logger.info("Starting block monitor. Target subnet: %d | Stake amount: %.8f TAO | fast_mode=%s",
                          self.subnet_id, self.stake_amount_tao, self.fast_mode)
 
-        # Basic signal handlers
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
         backoff = float(self.cfg["ws_reconnect_backoff_seconds"])
         max_backoff = float(self.cfg["ws_reconnect_max_backoff_seconds"])
-        subscription_mode = str(self.cfg.get("subscription_mode", "auto")).lower()
-        header_timeout = float(self.cfg.get("header_wait_timeout_seconds", 15.0))
-
-        def parse_block_number(header_obj: Any) -> Optional[int]:
-            try:
-                number = header_obj["header"]["number"]
-                return int(number, 16) if isinstance(number, str) else int(number)
-            except Exception:
-                try:
-                    number = header_obj.get("number", header_obj.get("block", {}).get("header", {}).get("number"))
-                    return int(number, 16) if isinstance(number, str) else int(number)
-                except Exception:
-                    return None
 
         while not self._shutdown:
             try:
-                # Detect subscribe_block_headers signature and choose mode
+                # Decide callback vs poll
                 use_callback = False
-                if subscription_mode == "poll":
+                if self.subscription_mode == "poll":
                     use_callback = False
-                elif subscription_mode == "callback":
+                elif self.subscription_mode == "callback":
                     use_callback = True
                 else:
                     try:
                         sig = inspect.signature(self.substrate.subscribe_block_headers)
-                        # If at least one required positional parameter is present, it's callback style
                         required = [p for p in sig.parameters.values() if p.default is p.empty]
                         use_callback = len(required) >= 1
                     except Exception:
@@ -737,64 +693,54 @@ class AutoStakeBot:
                 if use_callback:
                     self.logger.info("Subscribing to new block headers (callback mode)...")
                     q: "queue.Queue[Any]" = queue.Queue(maxsize=1024)
+                    sub_exc: Dict[str, Any] = {"err": None}
 
                     def handler(obj, update_nr=None, subscription_id=None):
                         try:
                             q.put_nowait(obj)
                         except Exception:
-                            # Drop if queue is full to avoid blocking
                             pass
 
-                    # Start subscription in a separate context - this blocks, so we need to handle it differently
-                    # The subscription call itself will block, so we consume from queue in the main thread
-                    import threading
-                    
-                    def subscription_thread():
-                        try:
-                            self.substrate.subscribe_block_headers(handler)
-                        except Exception as e:
-                            self.logger.warning("Subscription thread error: %s", str(e))
-                            q.put(None)  # Signal error
-                    
-                    thread = threading.Thread(target=subscription_thread, daemon=True)
-                    thread.start()
+                    t = threading.Thread(target=self._header_subscription_loop, args=(handler, q, sub_exc), daemon=True)
+                    t.start()
                     self.logger.info("Subscription thread started (callback mode).")
+
                     received_any_header = False
-                    deadline = time.time() + header_timeout
+                    deadline = time.time() + self.header_timeout
 
                     while not self._shutdown:
+                        # Thread liveness
+                        if not t.is_alive():
+                            if sub_exc["err"] is not None:
+                                raise sub_exc["err"]
+                            raise RuntimeError("Header subscription thread stopped")
                         try:
-                            header = q.get(timeout=5.0)
-                            if header is None:
-                                # Error signal from subscription thread
-                                raise RuntimeError("Subscription thread encountered an error")
+                            item = q.get(timeout=1.0)
+                            if isinstance(item, dict) and "__error__" in item:
+                                raise RuntimeError(f"Subscription error: {item['__error__']}")
                         except queue.Empty:
-                            # Check if thread is still alive
-                            if not thread.is_alive():
-                                raise RuntimeError("Subscription thread died")
-                            # Fallback if no headers received within timeout
                             if not received_any_header and time.time() > deadline:
-                                self.logger.info("No headers received within %.1fs. Falling back to polling mode.", header_timeout)
+                                self.logger.info("No headers received within %.1fs. Falling back to polling mode.", self.header_timeout)
                                 break
                             continue
-                        
-                        block_number = parse_block_number(header)
+
+                        block_number = self._parse_block_number(item)
                         if block_number is None:
                             continue
                         received_any_header = True
                         self.last_analyzed_block = block_number
                         self.logger.debug("New block: %d", block_number)
-                        # Unstake first, then analyze
                         self.execute_unstake(block_number)
                         self.analyze_block(block_number)
+
                 else:
                     self.logger.info("Subscribing to new block headers (iterator mode or polling fallback)...")
-                    # Try iterator mode first
+                    # Iterator attempt
                     try:
                         for header in self.substrate.subscribe_block_headers():
                             if self._shutdown:
                                 break
-                            block_number = parse_block_number(header)
+                            block_number = self._parse_block_number(header)
                             if block_number is None:
                                 continue
                             self.last_analyzed_block = block_number
@@ -802,9 +748,9 @@ class AutoStakeBot:
                             self.execute_unstake(block_number)
                             self.analyze_block(block_number)
                     except TypeError:
-                        # Fallback to polling if iterator not supported in this SDK
+                        # Poll fallback
                         self.logger.info("Iterator mode not supported; falling back to polling current block...")
-                        last_seen = None
+                        last_seen: Optional[int] = None
                         while not self._shutdown:
                             try:
                                 current = self.subtensor.get_current_block()
@@ -814,12 +760,11 @@ class AutoStakeBot:
                                     self.logger.debug("New block (poll): %d", current)
                                     self.execute_unstake(current)
                                     self.analyze_block(current)
-                                time.sleep(0.5)
+                                time.sleep(self.poll_interval)
                             except Exception as pe:
                                 self.logger.warning("Polling error: %s", str(pe))
                                 break
 
-                # Short breather before re-subscribing if loop exits normally
                 if not self._shutdown:
                     time.sleep(0.05)
 
@@ -830,8 +775,9 @@ class AutoStakeBot:
                 self.logger.info("Reconnecting in %.2fs...", backoff)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
-                # Attempt to re-fetch substrate via subtensor (auto-reconnect)
                 try:
+                    # Recreate primary substrate client
+                    self.subtensor = self._new_subtensor()
                     self.substrate = self.subtensor.substrate
                 except Exception:
                     pass
@@ -843,7 +789,7 @@ class AutoStakeBot:
         self._shutdown = True
 
 
-# Module-level functions expected by the spec, delegating to global BOT instance
+# Module-level functions expected by the earlier spec
 def monitor_blocks():
     if BOT is None:
         raise RuntimeError("Bot not initialized")
@@ -896,7 +842,6 @@ def load_or_create_config(path: str) -> Dict[str, Any]:
     else:
         cfg = _simple_parse_yaml(path)
 
-    # Merge with defaults for missing keys
     merged = DEFAULT_CONFIG.copy()
     merged.update(cfg)
     return merged
@@ -905,9 +850,7 @@ def load_or_create_config(path: str) -> Dict[str, Any]:
 def main():
     cfg = load_or_create_config(CONFIG_PATH)
 
-    # Echo config (mask sensitive fields if any added later)
-    to_log = {k: v for k, v in cfg.items()}
-    print("Loaded config:", json.dumps(to_log, indent=2))
+    print("Loaded config:", json.dumps(cfg, indent=2))
 
     global BOT
     BOT = AutoStakeBot(cfg)
@@ -918,7 +861,6 @@ def main():
         print(f"Initialization failed: {e}")
         sys.exit(1)
 
-    # Start monitoring loop (blocking)
     BOT.monitor_blocks()
 
 
