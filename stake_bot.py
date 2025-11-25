@@ -41,7 +41,10 @@ from logging.handlers import RotatingFileHandler
 from typing import Optional, Dict, Any, List
 
 import bittensor as bt
-from bittensor.wallet import Wallet
+try:
+    from bittensor.wallet import Wallet as WalletCls  # newer SDK path
+except Exception:
+    WalletCls = None
 
 # Optional YAML dependency with minimal fallback parser
 try:
@@ -208,7 +211,7 @@ class AutoStakeBot:
 
         self.subtensor: Optional[bt.Subtensor] = None
         self.substrate = None
-        self.wallet: Optional[Wallet] = None
+        self.wallet: Optional[Any] = None
         self.nonce_mgr: Optional[NonceManager] = None
 
         # State for trigger/unstake coordination
@@ -237,6 +240,29 @@ class AutoStakeBot:
             )
             handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
             logging.getLogger().addHandler(handler)
+
+    def _create_wallet(self):
+        """
+        Create a Bittensor wallet object compatible across SDK versions.
+        Tries:
+          1) WalletCls from bittensor.wallet (newer SDKs)
+          2) bt.wallet(name=..., hotkey=...) (older SDKs)
+        """
+        # Newer SDK
+        if 'WalletCls' in globals() and WalletCls is not None:
+            try:
+                return WalletCls(name=self.wallet_name, hotkey=self.hotkey_name)
+            except Exception as e:
+                self.logger.debug("WalletCls init failed: %s", e)
+
+        # Older SDK: function-style factory on bittensor module
+        try:
+            if hasattr(bt, "wallet") and callable(getattr(bt, "wallet")):
+                return bt.wallet(name=self.wallet_name, hotkey=self.hotkey_name)
+        except Exception as e:
+            self.logger.debug("bt.wallet init failed: %s", e)
+
+        raise RuntimeError("Bittensor Wallet API not found. Install compatible bittensor in this venv, e.g.: pip install 'bittensor==9.15.3'")
 
     def _load_state(self):
         if not self.persist_state:
@@ -267,8 +293,8 @@ class AutoStakeBot:
 
     def initialize(self):
         self.logger.info("Initializing wallet and network connection...")
-        # Wallet
-        self.wallet = Wallet(name=self.wallet_name, hotkey=self.hotkey_name)
+        # Wallet (SDK-compatible creation)
+        self.wallet = self._create_wallet()
         self.wallet.create_if_non_existent()
 
         # Unlock coldkey once per process (supports config/env), prompt only once if needed
