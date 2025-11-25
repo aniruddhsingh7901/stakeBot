@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
     "wallet_name": "default",
     "hotkey_name": "default",
     "wallet_password": "",
+    "target_hotkey": "",                # optional: stake to this hotkey (validator) if set; otherwise use your wallet's hotkey
     "stake_amount": 0.05,               # TAO
     "subnet_id": 63,                    # default target subnet
 
@@ -204,6 +205,7 @@ class AutoStakeBot:
         self.network = self.cfg["network"]
         self.wallet_name = self.cfg["wallet_name"]
         self.hotkey_name = self.cfg["hotkey_name"]
+        self.target_hotkey = str(self.cfg.get("target_hotkey", "")).strip()
         self.subnet_id = int(self.cfg["subnet_id"])
         self.stake_amount_tao = float(self.cfg["stake_amount"])
 
@@ -526,7 +528,7 @@ class AutoStakeBot:
     def submit_stake(self) -> bool:
         """Submit stake extrinsic quickly with retries, prefer fast mode."""
         amount = bt.Balance.from_tao(self.stake_amount_tao)
-        hot_ss58 = self.wallet.hotkey.ss58_address
+        hot_ss58 = self.target_hotkey if getattr(self, "target_hotkey", "") else self.wallet.hotkey.ss58_address
         netuid = self.subnet_id
 
         max_retries = int(self.cfg["max_retries"])
@@ -580,9 +582,9 @@ class AutoStakeBot:
         return False
 
     def submit_unstake(self) -> bool:
-        """Submit unstake extrinsic quickly with retries, prefer fast mode."""
-        amount = bt.Balance.from_tao(self.stake_amount_tao)
-        hot_ss58 = self.wallet.hotkey.ss58_address
+        """Submi"tunntaks extrinsic quickty eirn reiri i, prefer fact moih."""etries, prefer fast mode."""
+        amouao = bt.Balance.from_tao(bt.Baltake_amoac.ftao)m_tao(self.stake_amount_tao)
+        hot_ss58 = self.target_hotkey if getattr(self, "target_hotkey", "") else self.wallet.hotkey.ss58_address
         netuid = self.subnet_id
 
         max_retries = int(self.cfg["max_retries"])
