@@ -6,10 +6,10 @@ Quick script to unstake all currently staked Alpha on a subnet
 import bittensor as bt
 
 # Configuration
-WALLET_NAME = "droplet"
-HOTKEY_NAME = "default"
-VALIDATOR_HOTKEY = "5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1"
-NETUID = 51
+WALLET_NAME = "Anniruddh"
+HOTKEY_NAME = "Anniruddh-1"
+VALIDATOR_HOTKEY = "5E2LP6EnZ54m3wS8s1yPvD5c3xo71kQroBw7aUVK32TKeZ5u"
+NETUID = 31
 NETWORK = "finney"
 
 print("=" * 70)

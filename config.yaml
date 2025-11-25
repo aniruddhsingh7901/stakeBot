@@ -1,0 +1,61 @@
+# Event-Driven Staking Bot Configuration (Production-Optimized)
+# Edit values as needed. This file is read at startup by stake_bot.py
+
+# Network to connect to: "finney" (mainnet) or "test"
+network: finney
+
+# Bittensor wallet identifiers
+wallet_name: default
+hotkey_name: default
+
+# Stake amount in TAO (floating point). Example: 0.05
+stake_amount: 0.05
+
+# Target subnet ID to monitor and stake on. Default: 63 (SN63)
+subnet_id: 63
+
+# =========================
+# Performance & Behavior
+# =========================
+# fast_mode true enables explicit nonce + optional tip, direct extrinsic submit for minimal latency
+fast_mode: true
+
+# Optional tip in TAO to improve transaction priority (0 for none). Example: 0.001
+tip_tao: 0.0
+
+# Submit without waiting for inclusion/finalization for max speed
+wait_for_inclusion: false
+wait_for_finalization: false
+
+# =========================
+# Submission and retry behavior
+# =========================
+max_retries: 5
+retry_backoff_seconds: 0.5     # initial backoff for retries
+max_backoff_seconds: 4.0       # cap for backoff
+
+# =========================
+# Websocket reconnect/backoff on disconnects or RPC issues
+# =========================
+ws_reconnect_backoff_seconds: 1.0
+ws_reconnect_max_backoff_seconds: 8.0
+
+# =========================
+# Logging configuration
+# =========================
+log_level: INFO         # DEBUG | INFO | WARNING | ERROR
+log_to_file: true
+log_file: stake_bot.log
+
+# =========================
+# State persistence (to survive restarts cleanly)
+# =========================
+persist_state: true
+state_file: stake_state.json
+
+# =========================
+# Trigger safety
+# =========================
+# If false: do not trigger a new stake while an unstake is pending (safer nonces)
+# If true: allow overlapping triggers (more aggressive; ensure you can handle nonce priority)
+allow_overlap_triggers: false
