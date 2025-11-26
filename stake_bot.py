@@ -263,6 +263,7 @@ class AutoStakeBot:
         self.last_analyzed_block: Optional[int] = None
         self.last_staked_block_map: Dict[int, int] = {}        # netuid -> last staked block
         self.pending_unstake_blocks: Dict[int, int] = {}       # netuid -> scheduled unstake block
+        self.alpha_added_last_block: Dict[int, int] = {}       # netuid -> alpha amount from our last stake event
         # Legacy single fields kept for migration
         self._legacy_last_staked_block: Optional[int] = None
         self._legacy_pending_unstake_block: Optional[int] = None
@@ -645,6 +646,80 @@ class AutoStakeBot:
         """Return {netuid: count} of StakeRemoved in provided events (for diagnostics)."""
         return self._count_event_by_subnet(events, {"StakeRemoved"})
 
+    def _update_last_alpha_from_events(self, events) -> None:
+        """
+        Scan events for our own StakeAdded and record the alpha amount per netuid.
+        Event ordering observed: (coldkey, hotkey, tao, alpha, netuid, fee)
+        """
+        try:
+            if not events:
+                return
+            my_cold = self.wallet.coldkeypub.ss58_address if self.wallet and self.wallet.coldkeypub else None
+            my_hot = self.target_hotkey if self.target_hotkey else (self.wallet.hotkey.ss58_address if self.wallet and self.wallet.hotkey else None)
+            if not my_cold and not my_hot:
+                return
+
+            def _coerce_int(val):
+                if isinstance(val, int):
+                    return val
+                if isinstance(val, str):
+                    try:
+                        if val.lower().startswith("0x"):
+                            return int(val, 16)
+                        return int(val)
+                    except Exception:
+                        return None
+                return None
+
+            for ev in events:
+                try:
+                    evval = ev.value if hasattr(ev, "value") else ev
+                    evt = evval.get("event", {}) if isinstance(evval, dict) else {}
+                    module_id = evt.get("module_id") or evt.get("pallet") or evt.get("module") or ""
+                    event_id = evt.get("event_id") or evt.get("event") or evt.get("name") or ""
+                    if module_id not in {"SubtensorModule", "Subtensor"} or event_id != "StakeAdded":
+                        continue
+
+                    params = (
+                        evt.get("attributes")
+                        or evt.get("params")
+                        or evt.get("data")
+                        or evt.get("args")
+                        or []
+                    )
+                    # Normalize to plain list of values in order
+                    values = []
+                    for p in params:
+                        if isinstance(p, dict) and "value" in p:
+                            values.append(p["value"])
+                        else:
+                            values.append(p)
+
+                    # Guard for expected minimum length
+                    if len(values) < 6:
+                        continue
+
+                    cold_ss58 = str(values[0])
+                    hot_ss58 = str(values[1])
+                    tao_val = _coerce_int(values[2])
+                    alpha_val = _coerce_int(values[3])
+                    netuid_val = _coerce_int(values[4])
+
+                    # Match our own event by cold/hot where possible
+                    match = False
+                    if my_cold and cold_ss58 == my_cold:
+                        match = True
+                    if my_hot and hot_ss58 == my_hot:
+                        match = True
+
+                    if match and netuid_val is not None and alpha_val is not None and alpha_val > 0:
+                        self.alpha_added_last_block[int(netuid_val)] = int(alpha_val)
+                        self.logger.debug("Captured alpha from StakeAdded: netuid=%s alpha=%s", netuid_val, alpha_val)
+                except Exception:
+                    continue
+        except Exception as e:
+            self.logger.debug("Failed to update alpha from events: %s", str(e))
+
     def _best_effort_tip_rao(self) -> Optional[int]:
         if self.tip_tao <= 0:
             return None
@@ -900,13 +975,14 @@ class AutoStakeBot:
                     modules = (list(dict.fromkeys([self.call_pallet, "SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]))
                                if self.call_pallet else ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"])
                     funcs = self.unstake_call_candidates
+                    # Try minimal arg shapes first (metadata unavailable on some nodes)
                     for pv in (
-                        {"hotkey": hot_ss58, "netuid": int(netuid), "amount_unstaked": int(amount.rao)},
                         {"netuid": int(netuid), "amount_unstaked": int(amount.rao)},
-                        {"hotkey": hot_ss58, "netuid": int(netuid), "alpha_unstaked": int(amount.rao)},
                         {"netuid": int(netuid), "alpha_unstaked": int(amount.rao)},
-                        {"hotkey": hot_ss58, "netuid": int(netuid), "amount": int(amount.rao)},
-                        {"netuid": int(netuid), "amount": int(amount.rao)}
+                        {"netuid": int(netuid), "amount": int(amount.rao)},
+                        {"hotkey": hot_ss58, "netuid": int(netuid), "amount_unstaked": int(amount.rao)},
+                        {"hotkey": hot_ss58, "netuid": int(netuid), "alpha_unstaked": int(amount.rao)},
+                        {"hotkey": hot_ss58, "netuid": int(netuid), "amount": int(amount.rao)}
                     ):
                         self.logger.debug("Trying fast compose %s.%s with params=%s", (modules[0] if modules else "SubtensorModule"), (funcs[0] if funcs else "remove_stake"), list(pv.keys()))
                         if self._submit_extrinsic_multi(modules, funcs, pv):
@@ -959,6 +1035,17 @@ class AutoStakeBot:
             counts_removed = self._count_stake_removed_by_subnet(events)
             if counts_removed:
                 self.logger.debug("Block %d: StakeRemoved per subnet = %s", block_number, counts_removed)
+
+            # Capture our last stake alpha for use in next-block unstake
+
+            # Count StakeAdded (trigger) and StakeRemoved (diagnostics)
+            counts_added = self._count_stake_added_by_subnet(events)
+            counts_removed = self._count_stake_removed_by_subnet(events)
+            if counts_removed:
+                self.logger.debug("Block %d: StakeRemoved per subnet = %s", block_number, counts_removed)
+
+            # Capture our last stake alpha for use in next-block unstake
+            self._update_last_alpha_from_events(events)
 
             if not counts_added:
                 self.logger.debug("Block %d: no StakeAdded events", block_number)
