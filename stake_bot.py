@@ -105,6 +105,7 @@ DEFAULT_CONFIG = {
 
     # Submission behavior
     "no_sdk_fallback": True,             # if True, do not fallback to SDK path; only use fast extrinsic
+    "unstake_signer": "auto",            # 'coldkey' | 'hotkey' | 'auto': which key signs unstake; auto tries coldkey then hotkey
 
     # Logging
     "log_level": "INFO",                 # DEBUG | INFO | WARNING | ERROR
@@ -120,7 +121,8 @@ DEFAULT_CONFIG = {
     "events_dir": "block_events",        # directory to write per-block JSON files
 
     # Trigger safety
-    "allow_overlap_triggers": False      # if False: don't trigger stake while an unstake is pending per-subnet
+    "allow_overlap_triggers": False,     # if False: don't trigger stake while an unstake is pending per-subnet
+    "block_new_stakes_while_pending_unstake": True  # if True: globally block all new stakes until all pending unstakes execute
 }
 
 CONFIG_PATH = os.environ.get("STAKE_BOT_CONFIG", "config.yaml")
@@ -243,9 +245,13 @@ class AutoStakeBot:
         self.header_timeout = float(self.cfg.get("header_wait_timeout_seconds", 3.0))
         self.poll_interval = float(self.cfg.get("poll_interval_seconds", 0.5))
         self.no_sdk_fallback = bool(self.cfg.get("no_sdk_fallback", True))
+        self.unstake_signer = str(self.cfg.get("unstake_signer", "auto")).lower()
         # Event export
         self.export_events = bool(self.cfg.get("export_events", True))
         self.events_dir = str(self.cfg.get("events_dir", "block_events"))
+
+        # Global gating
+        self.block_new_stakes_globally = bool(self.cfg.get("block_new_stakes_while_pending_unstake", True))
 
         # Clients
         self.subtensor: Optional[bt.Subtensor] = None         # primary client (headers)
@@ -258,6 +264,7 @@ class AutoStakeBot:
         # Wallet & Nonce
         self.wallet: Optional[Any] = None
         self.nonce_mgr: Optional[NonceManager] = None
+        self.nonce_mgr_hot: Optional[NonceManager] = None
 
         # State (trigger/unstake coordination) per subnet
         self.last_analyzed_block: Optional[int] = None
@@ -301,9 +308,11 @@ class AutoStakeBot:
             if os.path.exists(path):
                 with open(path, "r") as f:
                     s = json.load(f)
-                # New format
-                self.last_staked_block_map = s.get("last_staked_block_map", {}) or {}
-                self.pending_unstake_blocks = s.get("pending_unstake_blocks", {}) or {}
+                # New format - ensure keys are integers
+                raw_staked = s.get("last_staked_block_map", {}) or {}
+                raw_pending = s.get("pending_unstake_blocks", {}) or {}
+                self.last_staked_block_map = {int(k): v for k, v in raw_staked.items()}
+                self.pending_unstake_blocks = {int(k): v for k, v in raw_pending.items()}
                 # Legacy migration
                 self._legacy_last_staked_block = s.get("last_staked_block")
                 self._legacy_pending_unstake_block = s.get("pending_unstake_block")
@@ -407,6 +416,7 @@ class AutoStakeBot:
         # Nonce manager (signer is coldkey)
         signer_ss58 = self.wallet.coldkeypub.ss58_address
         self.nonce_mgr = NonceManager(self.substrate_tx, signer_ss58, self.logger)
+        self.nonce_mgr_hot = NonceManager(self.substrate_tx, self.wallet.hotkey.ss58_address, self.logger)
 
         # Balance check
         bal = self.subtensor.get_balance(signer_ss58)
@@ -728,6 +738,25 @@ class AutoStakeBot:
         except Exception:
             return None
 
+    def _select_signer(self, which: str):
+        try:
+            if which == "hotkey":
+                return self.wallet.hotkey
+            return self.wallet.coldkey
+        except Exception:
+            return self.wallet.coldkey
+
+    def _nonce_mgr_for(self, signer_keypair) -> Optional[NonceManager]:
+        try:
+            addr = getattr(signer_keypair, "ss58_address", None)
+            if addr == (self.wallet.coldkeypub.ss58_address if self.wallet and self.wallet.coldkeypub else None):
+                return self.nonce_mgr
+            if addr == (self.wallet.hotkey.ss58_address if self.wallet and self.wallet.hotkey else None):
+                return getattr(self, "nonce_mgr_hot", None)
+        except Exception:
+            pass
+        return self.nonce_mgr
+
     def _get_call_args(self, call_module: str, call_name: str) -> Optional[List[str]]:
         """Return ordered argument names for a call from runtime metadata."""
         try:
@@ -818,7 +847,7 @@ class AutoStakeBot:
 
         return resolved
 
-    def _submit_extrinsic_fast(self, call_module: str, call_function_candidates: List[str], params: Dict[str, Any]) -> Optional[str]:
+    def _submit_extrinsic_fast(self, call_module: str, call_function_candidates: List[str], params: Dict[str, Any], signer_keypair) -> Optional[str]:
         """Submit extrinsic via dedicated tx substrate with explicit nonce & tip (no waits)."""
         try:
             call = None
@@ -846,12 +875,13 @@ class AutoStakeBot:
                     self.logger.debug("Last compose_call error: %s", str(last_err))
                 return None
 
-            nonce = self.nonce_mgr.next_and_increment() if self.nonce_mgr else None
+            nm = self._nonce_mgr_for(signer_keypair)
+            nonce = nm.next_and_increment() if nm else None
             tip_rao = self._best_effort_tip_rao()
 
             extrinsic = self.substrate_tx.create_signed_extrinsic(
                 call=call,
-                keypair=self.wallet.coldkey,
+                keypair=signer_keypair,
                 tip=tip_rao if tip_rao is not None else 0,
                 nonce=nonce
             )
@@ -874,16 +904,17 @@ class AutoStakeBot:
             es = str(e)
             self.logger.warning("Fast submit error: %s", es)
             if any(x in es for x in ("Priority is too low", "Future", "Stale", "Old")):
-                if self.nonce_mgr:
-                    self.nonce_mgr.invalidate()
-                    self.nonce_mgr.refresh()
+                nm = self._nonce_mgr_for(signer_keypair)
+                if nm:
+                    nm.invalidate()
+                    nm.refresh()
             return None
 
-    def _submit_extrinsic_multi(self, module_candidates: List[str], func_candidates: List[str], params: Dict[str, Any]) -> Optional[str]:
+    def _submit_extrinsic_multi(self, module_candidates: List[str], func_candidates: List[str], params: Dict[str, Any], signer_keypair) -> Optional[str]:
         """Try multiple module and function name variants to compose and submit an extrinsic quickly."""
         for mod in module_candidates:
             try:
-                res = self._submit_extrinsic_fast(mod, func_candidates, params)
+                res = self._submit_extrinsic_fast(mod, func_candidates, params, signer_keypair)
                 if res:
                     return res
             except Exception:
@@ -907,8 +938,8 @@ class AutoStakeBot:
             try:
                 if self.fast_mode:
                     self.logger.info("Submitting STAKE fast %.8f TAO on subnet %s (attempt %d/%d)", self.stake_amount_tao, str(netuid), attempt, max_retries)
-                    modules = (list(dict.fromkeys([self.call_pallet, "SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]))
-                               if self.call_pallet else ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"])
+                    modules = (list(dict.fromkeys([self.call_pallet, "SubtensorModule"]))
+                               if self.call_pallet else ["SubtensorModule"])
                     funcs = self.stake_call_candidates
                     # Param variants across runtime versions
                     for pv in (
@@ -920,7 +951,7 @@ class AutoStakeBot:
                         {"netuid": int(netuid), "stake_to_be_added": int(amount.rao)}
                     ):
                         self.logger.debug("Trying fast compose %s.%s with params=%s", (modules[0] if modules else "SubtensorModule"), (funcs[0] if funcs else "add_stake"), list(pv.keys()))
-                        if self._submit_extrinsic_multi(modules, funcs, pv):
+                        if self._submit_extrinsic_multi(modules, funcs, pv, self.wallet.coldkey):
                             return True
                     self.logger.debug("Fast path failed; falling back to SDK path.")
                     if self.no_sdk_fallback:
@@ -961,7 +992,17 @@ class AutoStakeBot:
         """Submit unstake extrinsic quickly with retries (prefer fast path)."""
         if netuid is None:
             netuid = self.subnet_id
-        amount = bt.Balance.from_tao(self.stake_amount_tao)
+        
+        # Use captured alpha amount if available, otherwise fall back to configured TAO amount
+        alpha_rao = self.alpha_added_last_block.get(netuid)
+        if alpha_rao is not None and alpha_rao > 0:
+            amount_rao = alpha_rao
+            self.logger.info("Using captured alpha amount: %d rao for subnet %d", amount_rao, netuid)
+        else:
+            amount = bt.Balance.from_tao(self.stake_amount_tao)
+            amount_rao = int(amount.rao)
+            self.logger.warning("No captured alpha for subnet %d; using configured TAO amount: %d rao", netuid, amount_rao)
+        
         hot_ss58 = self.target_hotkey if self.target_hotkey else self.wallet.hotkey.ss58_address
 
         max_retries = int(self.cfg["max_retries"])
@@ -971,22 +1012,38 @@ class AutoStakeBot:
         for attempt in range(1, max_retries + 1):
             try:
                 if self.fast_mode:
-                    self.logger.info("Submitting UNSTAKE fast %.8f TAO on subnet %s (attempt %d/%d)", self.stake_amount_tao, str(netuid), attempt, max_retries)
-                    modules = (list(dict.fromkeys([self.call_pallet, "SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]))
-                               if self.call_pallet else ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"])
+                    self.logger.info("Submitting UNSTAKE fast %d rao on subnet %s (attempt %d/%d)", amount_rao, str(netuid), attempt, max_retries)
+                    modules = (list(dict.fromkeys([self.call_pallet, "SubtensorModule"]))
+                               if self.call_pallet else ["SubtensorModule"])
                     funcs = self.unstake_call_candidates
+                    # Try both signers if configured to auto, otherwise the selected one
+                    signers_to_try = []
+                    us = self.unstake_signer
+                    if us == "hotkey":
+                        signers_to_try = [self.wallet.hotkey]
+                    elif us == "coldkey":
+                        signers_to_try = [self.wallet.coldkey]
+                    else:
+                        signers_to_try = [self.wallet.coldkey, self.wallet.hotkey]
                     # Try minimal arg shapes first (metadata unavailable on some nodes)
-                    for pv in (
-                        {"netuid": int(netuid), "amount_unstaked": int(amount.rao)},
-                        {"netuid": int(netuid), "alpha_unstaked": int(amount.rao)},
-                        {"netuid": int(netuid), "amount": int(amount.rao)},
-                        {"hotkey": hot_ss58, "netuid": int(netuid), "amount_unstaked": int(amount.rao)},
-                        {"hotkey": hot_ss58, "netuid": int(netuid), "alpha_unstaked": int(amount.rao)},
-                        {"hotkey": hot_ss58, "netuid": int(netuid), "amount": int(amount.rao)}
-                    ):
-                        self.logger.debug("Trying fast compose %s.%s with params=%s", (modules[0] if modules else "SubtensorModule"), (funcs[0] if funcs else "remove_stake"), list(pv.keys()))
-                        if self._submit_extrinsic_multi(modules, funcs, pv):
-                            return True
+                    for signer in signers_to_try:
+                        for pv in (
+                            {"hotkey": hot_ss58, "netuid": int(netuid), "amount_unstaked": amount_rao},
+                            {"hotkey": hot_ss58, "netuid": int(netuid), "alpha_unstaked": amount_rao},
+                            {"hotkey": hot_ss58, "netuid": int(netuid), "amount": amount_rao},
+                            {"netuid": int(netuid), "amount_unstaked": amount_rao},
+                            {"netuid": int(netuid), "alpha_unstaked": amount_rao},
+                            {"netuid": int(netuid), "amount": amount_rao}
+                        ):
+                            self.logger.debug(
+                                "Trying fast compose %s.%s with params=%s (signer=%s)",
+                                (modules[0] if modules else "SubtensorModule"),
+                                (funcs[0] if funcs else "remove_stake"),
+                                list(pv.keys()),
+                                ("hotkey" if signer is self.wallet.hotkey else "coldkey")
+                            )
+                            if self._submit_extrinsic_multi(modules, funcs, pv, signer):
+                                return True
                     self.logger.debug("Fast path failed; falling back to SDK path.")
                     if self.no_sdk_fallback:
                         self.logger.warning("no_sdk_fallback=true: skipping SDK unstake path; will retry fast path only")
@@ -996,11 +1053,12 @@ class AutoStakeBot:
 
                 # SDK fallback (only if allowed)
                 if not self.no_sdk_fallback:
-                    self.logger.info("Submitting UNSTAKE via SDK %.8f TAO on subnet %d (attempt %d/%d)", self.stake_amount_tao, netuid, attempt, max_retries)
+                    amount_bal = bt.Balance.from_rao(amount_rao)
+                    self.logger.info("Submitting UNSTAKE via SDK %d rao on subnet %d (attempt %d/%d)", amount_rao, netuid, attempt, max_retries)
                     success = self.subtensor.unstake(
                         wallet=self.wallet,
                         hotkey_ss58=hot_ss58,
-                        amount=amount,
+                        amount=amount_bal,
                         netuid=netuid,
                         wait_for_inclusion=self.wait_for_inclusion,
                         wait_for_finalization=self.wait_for_finalization
@@ -1051,6 +1109,12 @@ class AutoStakeBot:
                 self.logger.debug("Block %d: no StakeAdded events", block_number)
                 return
 
+            # Global gate: if any unstake is pending, skip all new stakes until it executes
+            if self.block_new_stakes_globally and len(self.pending_unstake_blocks) > 0:
+                self.logger.info("Pending unstake(s) present %s; skipping new stake triggers until unstake executes.",
+                                 dict(self.pending_unstake_blocks))
+                return
+
             # Determine which subnets to consider based on mode
             candidate_netuids: List[int] = []
             if self.subnet_mode == "any":
@@ -1098,7 +1162,7 @@ class AutoStakeBot:
                 due.append(netuid)
 
         for netuid in due:
-            self.logger.info("Unstake due at block %d for subnet %d (scheduled: %d)", current_block, netuid, self.pending_unstake_blocks[netuid])
+            self.logger.info("Unstake due at block %d for subnet %d (scheduled: %d)", current_block, int(netuid), int(self.pending_unstake_blocks.get(netuid, -1)))
             ok = self.submit_unstake(netuid)
             if ok:
                 del self.pending_unstake_blocks[netuid]
