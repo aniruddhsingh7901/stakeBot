@@ -105,6 +105,7 @@ DEFAULT_CONFIG = {
 
     # Submission behavior
     "no_sdk_fallback": True,             # if True, do not fallback to SDK path; only use fast extrinsic
+    "unstake_signer": "auto",            # 'coldkey' | 'hotkey' | 'auto': which key signs unstake; auto tries coldkey then hotkey
 
     # Logging
     "log_level": "INFO",                 # DEBUG | INFO | WARNING | ERROR
@@ -120,7 +121,8 @@ DEFAULT_CONFIG = {
     "events_dir": "block_events",        # directory to write per-block JSON files
 
     # Trigger safety
-    "allow_overlap_triggers": False      # if False: don't trigger stake while an unstake is pending per-subnet
+    "allow_overlap_triggers": False,     # if False: don't trigger stake while an unstake is pending per-subnet
+    "block_new_stakes_while_pending_unstake": True  # if True: globally block all new stakes until all pending unstakes execute
 }
 
 CONFIG_PATH = os.environ.get("STAKE_BOT_CONFIG", "config.yaml")
@@ -243,9 +245,13 @@ class AutoStakeBot:
         self.header_timeout = float(self.cfg.get("header_wait_timeout_seconds", 3.0))
         self.poll_interval = float(self.cfg.get("poll_interval_seconds", 0.5))
         self.no_sdk_fallback = bool(self.cfg.get("no_sdk_fallback", True))
+        self.unstake_signer = str(self.cfg.get("unstake_signer", "auto")).lower()
         # Event export
         self.export_events = bool(self.cfg.get("export_events", True))
         self.events_dir = str(self.cfg.get("events_dir", "block_events"))
+
+        # Global gating
+        self.block_new_stakes_globally = bool(self.cfg.get("block_new_stakes_while_pending_unstake", True))
 
         # Clients
         self.subtensor: Optional[bt.Subtensor] = None         # primary client (headers)
@@ -258,22 +264,27 @@ class AutoStakeBot:
         # Wallet & Nonce
         self.wallet: Optional[Any] = None
         self.nonce_mgr: Optional[NonceManager] = None
+        self.nonce_mgr_hot: Optional[NonceManager] = None
 
         # State (trigger/unstake coordination) per subnet
         self.last_analyzed_block: Optional[int] = None
         self.last_staked_block_map: Dict[int, int] = {}        # netuid -> last staked block
         self.pending_unstake_blocks: Dict[int, int] = {}       # netuid -> scheduled unstake block
+        self.alpha_added_last_block: Dict[int, int] = {}       # netuid -> alpha amount from our last stake event
         # Legacy single fields kept for migration
         self._legacy_last_staked_block: Optional[int] = None
         self._legacy_pending_unstake_block: Optional[int] = None
 
         # Runtime call discovery/caching
         self.call_pallet: Optional[str] = None
-        self.stake_call_candidates: List[str] = ["add_stake", "addStake", "add_stake_limit", "addStakeLimit"]
-        self.unstake_call_candidates: List[str] = ["remove_stake", "removeStake", "remove_stake_limit", "removeStakeLimit", "remove_stake_full_limit", "removeStakeFullLimit"]
+        self.stake_call_candidates: List[str] = ["add_stake"]
+        self.unstake_call_candidates: List[str] = ["remove_stake_full_limit", "remove_stake"]
 
         # Concurrency/threading
         self._shutdown = False
+        
+        # Rate limiting: Track last operation time
+        self.last_operation_time: float = 0.0  # Unix timestamp of last stake/unstake
 
     def _setup_logging(self):
         level = getattr(logging, str(self.cfg.get("log_level", "INFO")).upper(), logging.INFO)
@@ -300,9 +311,11 @@ class AutoStakeBot:
             if os.path.exists(path):
                 with open(path, "r") as f:
                     s = json.load(f)
-                # New format
-                self.last_staked_block_map = s.get("last_staked_block_map", {}) or {}
-                self.pending_unstake_blocks = s.get("pending_unstake_blocks", {}) or {}
+                # New format - ensure keys are integers
+                raw_staked = s.get("last_staked_block_map", {}) or {}
+                raw_pending = s.get("pending_unstake_blocks", {}) or {}
+                self.last_staked_block_map = {int(k): v for k, v in raw_staked.items()}
+                self.pending_unstake_blocks = {int(k): v for k, v in raw_pending.items()}
                 # Legacy migration
                 self._legacy_last_staked_block = s.get("last_staked_block")
                 self._legacy_pending_unstake_block = s.get("pending_unstake_block")
@@ -406,6 +419,7 @@ class AutoStakeBot:
         # Nonce manager (signer is coldkey)
         signer_ss58 = self.wallet.coldkeypub.ss58_address
         self.nonce_mgr = NonceManager(self.substrate_tx, signer_ss58, self.logger)
+        self.nonce_mgr_hot = NonceManager(self.substrate_tx, self.wallet.hotkey.ss58_address, self.logger)
 
         # Balance check
         bal = self.subtensor.get_balance(signer_ss58)
@@ -645,6 +659,80 @@ class AutoStakeBot:
         """Return {netuid: count} of StakeRemoved in provided events (for diagnostics)."""
         return self._count_event_by_subnet(events, {"StakeRemoved"})
 
+    def _update_last_alpha_from_events(self, events) -> None:
+        """
+        Scan events for our own StakeAdded and record the alpha amount per netuid.
+        Event ordering observed: (coldkey, hotkey, tao, alpha, netuid, fee)
+        """
+        try:
+            if not events:
+                return
+            my_cold = self.wallet.coldkeypub.ss58_address if self.wallet and self.wallet.coldkeypub else None
+            my_hot = self.target_hotkey if self.target_hotkey else (self.wallet.hotkey.ss58_address if self.wallet and self.wallet.hotkey else None)
+            if not my_cold and not my_hot:
+                return
+
+            def _coerce_int(val):
+                if isinstance(val, int):
+                    return val
+                if isinstance(val, str):
+                    try:
+                        if val.lower().startswith("0x"):
+                            return int(val, 16)
+                        return int(val)
+                    except Exception:
+                        return None
+                return None
+
+            for ev in events:
+                try:
+                    evval = ev.value if hasattr(ev, "value") else ev
+                    evt = evval.get("event", {}) if isinstance(evval, dict) else {}
+                    module_id = evt.get("module_id") or evt.get("pallet") or evt.get("module") or ""
+                    event_id = evt.get("event_id") or evt.get("event") or evt.get("name") or ""
+                    if module_id not in {"SubtensorModule", "Subtensor"} or event_id != "StakeAdded":
+                        continue
+
+                    params = (
+                        evt.get("attributes")
+                        or evt.get("params")
+                        or evt.get("data")
+                        or evt.get("args")
+                        or []
+                    )
+                    # Normalize to plain list of values in order
+                    values = []
+                    for p in params:
+                        if isinstance(p, dict) and "value" in p:
+                            values.append(p["value"])
+                        else:
+                            values.append(p)
+
+                    # Guard for expected minimum length
+                    if len(values) < 6:
+                        continue
+
+                    cold_ss58 = str(values[0])
+                    hot_ss58 = str(values[1])
+                    tao_val = _coerce_int(values[2])
+                    alpha_val = _coerce_int(values[3])
+                    netuid_val = _coerce_int(values[4])
+
+                    # Match our own event by cold/hot where possible
+                    match = False
+                    if my_cold and cold_ss58 == my_cold:
+                        match = True
+                    if my_hot and hot_ss58 == my_hot:
+                        match = True
+
+                    if match and netuid_val is not None and alpha_val is not None and alpha_val > 0:
+                        self.alpha_added_last_block[int(netuid_val)] = int(alpha_val)
+                        self.logger.debug("Captured alpha from StakeAdded: netuid=%s alpha=%s", netuid_val, alpha_val)
+                except Exception:
+                    continue
+        except Exception as e:
+            self.logger.debug("Failed to update alpha from events: %s", str(e))
+
     def _best_effort_tip_rao(self) -> Optional[int]:
         if self.tip_tao <= 0:
             return None
@@ -653,19 +741,52 @@ class AutoStakeBot:
         except Exception:
             return None
 
+    def _select_signer(self, which: str):
+        try:
+            if which == "hotkey":
+                return self.wallet.hotkey
+            return self.wallet.coldkey
+        except Exception:
+            return self.wallet.coldkey
+
+    def _nonce_mgr_for(self, signer_keypair) -> Optional[NonceManager]:
+        try:
+            addr = getattr(signer_keypair, "ss58_address", None)
+            if addr == (self.wallet.coldkeypub.ss58_address if self.wallet and self.wallet.coldkeypub else None):
+                return self.nonce_mgr
+            if addr == (self.wallet.hotkey.ss58_address if self.wallet and self.wallet.hotkey else None):
+                return getattr(self, "nonce_mgr_hot", None)
+        except Exception:
+            pass
+        return self.nonce_mgr
+
     def _get_call_args(self, call_module: str, call_name: str) -> Optional[List[str]]:
         """Return ordered argument names for a call from runtime metadata."""
         try:
             meta = self.substrate_tx.get_metadata_call_function(call_module, call_name)
-            # substrate-interface returns dict with 'args' entries having 'name'
-            args = meta.get("args") or []
+            args = (meta or {}).get("args") or []
+            # Fallback: try alternate pallet aliases if no args returned
+            if not args:
+                for alt in ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]:
+                    if alt == call_module:
+                        continue
+                    try:
+                        alt_meta = self.substrate_tx.get_metadata_call_function(alt, call_name)
+                        alt_args = (alt_meta or {}).get("args") or []
+                        if alt_args:
+                            self.logger.debug("Resolved metadata args for %s using alternate pallet '%s'", call_name, alt)
+                            args = alt_args
+                            break
+                    except Exception:
+                        continue
             names: List[str] = []
             for a in args:
                 n = a.get("name")
                 if isinstance(n, str):
                     names.append(n)
             return names if names else None
-        except Exception:
+        except Exception as e:
+            self.logger.debug("get_metadata_call_function failed for %s.%s: %s", call_module, call_name, str(e))
             return None
 
     def _build_params_for_call(self, call_module: str, call_name: str, provided: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -674,17 +795,22 @@ class AutoStakeBot:
         trying common synonyms across runtime versions.
         """
         expected = self._get_call_args(call_module, call_name)
+        self.logger.debug("Metadata args for %s.%s: %s", call_module, call_name, expected)
         if not expected:
             # Fall back to provided as-is if metadata is not accessible
             return provided
 
-        # synonym map per logical field
+        # synonym map per logical field (keys must match expected arg names from metadata)
         synonyms: Dict[str, List[str]] = {
-            # Stake add amount synonyms
-            "amount": ["amount", "stake", "stake_to_be_added", "stake_to_add", "value"],
-            # Unstake amount synonyms
-            "alpha_unstaked": ["alpha_unstaked", "amount", "unstake_amount", "value"],
-            # Hotkey and netuid are stable but include lowercase variants
+            # Stake amount field can be named 'amount_staked' on-chain
+            "amount_staked": ["amount_staked", "amount", "stake_to_be_added", "stake_to_add", "stake", "value"],
+            # Some runtimes may still use 'amount'
+            "amount": ["amount", "amount_staked", "stake_to_be_added", "stake_to_add", "stake", "value"],
+            # Unstake amount field can be named 'amount_unstaked' on-chain
+            "amount_unstaked": ["amount_unstaked", "alpha_unstaked", "amount", "unstake_amount", "value"],
+            # Older codepaths/users may provide 'alpha_unstaked'
+            "alpha_unstaked": ["alpha_unstaked", "amount_unstaked", "amount", "unstake_amount", "value"],
+            # Hotkey and netuid are relatively stable
             "hotkey": ["hotkey", "who", "account", "hotKey"],
             "netuid": ["netuid", "netUid", "net_uid", "subnet_id", "netUidId"],
         }
@@ -724,7 +850,7 @@ class AutoStakeBot:
 
         return resolved
 
-    def _submit_extrinsic_fast(self, call_module: str, call_function_candidates: List[str], params: Dict[str, Any]) -> Optional[str]:
+    def _submit_extrinsic_fast(self, call_module: str, call_function_candidates: List[str], params: Dict[str, Any], signer_keypair) -> Optional[str]:
         """Submit extrinsic via dedicated tx substrate with explicit nonce & tip (no waits)."""
         try:
             call = None
@@ -752,12 +878,13 @@ class AutoStakeBot:
                     self.logger.debug("Last compose_call error: %s", str(last_err))
                 return None
 
-            nonce = self.nonce_mgr.next_and_increment() if self.nonce_mgr else None
+            nm = self._nonce_mgr_for(signer_keypair)
+            nonce = nm.next_and_increment() if nm else None
             tip_rao = self._best_effort_tip_rao()
 
             extrinsic = self.substrate_tx.create_signed_extrinsic(
                 call=call,
-                keypair=self.wallet.coldkey,
+                keypair=signer_keypair,
                 tip=tip_rao if tip_rao is not None else 0,
                 nonce=nonce
             )
@@ -780,16 +907,17 @@ class AutoStakeBot:
             es = str(e)
             self.logger.warning("Fast submit error: %s", es)
             if any(x in es for x in ("Priority is too low", "Future", "Stale", "Old")):
-                if self.nonce_mgr:
-                    self.nonce_mgr.invalidate()
-                    self.nonce_mgr.refresh()
+                nm = self._nonce_mgr_for(signer_keypair)
+                if nm:
+                    nm.invalidate()
+                    nm.refresh()
             return None
 
-    def _submit_extrinsic_multi(self, module_candidates: List[str], func_candidates: List[str], params: Dict[str, Any]) -> Optional[str]:
+    def _submit_extrinsic_multi(self, module_candidates: List[str], func_candidates: List[str], params: Dict[str, Any], signer_keypair) -> Optional[str]:
         """Try multiple module and function name variants to compose and submit an extrinsic quickly."""
         for mod in module_candidates:
             try:
-                res = self._submit_extrinsic_fast(mod, func_candidates, params)
+                res = self._submit_extrinsic_fast(mod, func_candidates, params, signer_keypair)
                 if res:
                     return res
             except Exception:
@@ -813,14 +941,20 @@ class AutoStakeBot:
             try:
                 if self.fast_mode:
                     self.logger.info("Submitting STAKE fast %.8f TAO on subnet %s (attempt %d/%d)", self.stake_amount_tao, str(netuid), attempt, max_retries)
-                    modules = [self.call_pallet] if self.call_pallet else ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]
+                    modules = (list(dict.fromkeys([self.call_pallet, "SubtensorModule"]))
+                               if self.call_pallet else ["SubtensorModule"])
                     funcs = self.stake_call_candidates
                     # Param variants across runtime versions
                     for pv in (
-                        {"hotkey": hot_ss58, "amount": int(amount.rao), "netuid": int(netuid)},
-                        {"hotkey": hot_ss58, "stake_to_be_added": int(amount.rao), "netuid": int(netuid)},
+                        {"hotkey": hot_ss58, "netuid": int(netuid), "amount_staked": int(amount.rao)},
+                        {"netuid": int(netuid), "amount_staked": int(amount.rao)},
+                        {"hotkey": hot_ss58, "netuid": int(netuid), "amount": int(amount.rao)},
+                        {"netuid": int(netuid), "amount": int(amount.rao)},
+                        {"hotkey": hot_ss58, "netuid": int(netuid), "stake_to_be_added": int(amount.rao)},
+                        {"netuid": int(netuid), "stake_to_be_added": int(amount.rao)}
                     ):
-                        if self._submit_extrinsic_multi(modules, funcs, pv):
+                        self.logger.debug("Trying fast compose %s.%s with params=%s", (modules[0] if modules else "SubtensorModule"), (funcs[0] if funcs else "add_stake"), list(pv.keys()))
+                        if self._submit_extrinsic_multi(modules, funcs, pv, self.wallet.coldkey):
                             return True
                     self.logger.debug("Fast path failed; falling back to SDK path.")
                     if self.no_sdk_fallback:
@@ -861,7 +995,9 @@ class AutoStakeBot:
         """Submit unstake extrinsic quickly with retries (prefer fast path)."""
         if netuid is None:
             netuid = self.subnet_id
-        amount = bt.Balance.from_tao(self.stake_amount_tao)
+        
+        self.logger.info("Unstaking full amount from subnet %d", netuid)
+        
         hot_ss58 = self.target_hotkey if self.target_hotkey else self.wallet.hotkey.ss58_address
 
         max_retries = int(self.cfg["max_retries"])
@@ -871,15 +1007,55 @@ class AutoStakeBot:
         for attempt in range(1, max_retries + 1):
             try:
                 if self.fast_mode:
-                    self.logger.info("Submitting UNSTAKE fast %.8f TAO on subnet %s (attempt %d/%d)", self.stake_amount_tao, str(netuid), attempt, max_retries)
-                    modules = [self.call_pallet] if self.call_pallet else ["SubtensorModule", "Subtensor", "subtensorModule", "subtensor"]
+                    self.logger.info("Submitting UNSTAKE (full) fast on subnet %s (attempt %d/%d)", str(netuid), attempt, max_retries)
+                    modules = (list(dict.fromkeys([self.call_pallet, "SubtensorModule"]))
+                               if self.call_pallet else ["SubtensorModule"])
                     funcs = self.unstake_call_candidates
-                    for pv in (
-                        {"hotkey": hot_ss58, "alpha_unstaked": int(amount.rao), "netuid": int(netuid)},
-                        {"hotkey": hot_ss58, "amount": int(amount.rao), "netuid": int(netuid)},
-                    ):
-                        if self._submit_extrinsic_multi(modules, funcs, pv):
-                            return True
+                    # Try both signers if configured to auto, otherwise the selected one
+                    signers_to_try = []
+                    us = self.unstake_signer
+                    if us == "hotkey":
+                        signers_to_try = [self.wallet.hotkey]
+                    elif us == "coldkey":
+                        signers_to_try = [self.wallet.coldkey]
+                    else:
+                        signers_to_try = [self.wallet.coldkey, self.wallet.hotkey]
+                    # Try remove_stake_full_limit first (requires limit_price param)
+                    for signer in signers_to_try:
+                        # Try full unstake with limit_price (prevents price slippage)
+                        # limit_price of 0 means no price limit (unstake at any price)
+                        for pv in (
+                            {"hotkey": hot_ss58, "netuid": int(netuid), "limit_price": 0},
+                            {"hotkey": hot_ss58, "netuid": int(netuid), "limit_price": "0"},
+                            {"netuid": int(netuid), "limit_price": 0},
+                            {"netuid": int(netuid), "limit_price": "0"}
+                        ):
+                            self.logger.debug(
+                                "Trying fast compose remove_stake_full_limit with params=%s (signer=%s)",
+                                list(pv.keys()),
+                                ("hotkey" if signer is self.wallet.hotkey else "coldkey")
+                            )
+                            if self._submit_extrinsic_multi(modules, ["remove_stake_full_limit"], pv, signer):
+                                return True
+                        
+                        # Fallback to remove_stake with amount if full unstake not available
+                        amount = bt.Balance.from_tao(self.stake_amount_tao)
+                        amount_rao = int(amount.rao)
+                        for pv in (
+                            {"hotkey": hot_ss58, "netuid": int(netuid), "amount_unstaked": amount_rao},
+                            {"hotkey": hot_ss58, "netuid": int(netuid), "alpha_unstaked": amount_rao},
+                            {"hotkey": hot_ss58, "netuid": int(netuid), "amount": amount_rao},
+                            {"netuid": int(netuid), "amount_unstaked": amount_rao},
+                            {"netuid": int(netuid), "alpha_unstaked": amount_rao},
+                            {"netuid": int(netuid), "amount": amount_rao}
+                        ):
+                            self.logger.debug(
+                                "Trying fast compose remove_stake with params=%s (signer=%s)",
+                                list(pv.keys()),
+                                ("hotkey" if signer is self.wallet.hotkey else "coldkey")
+                            )
+                            if self._submit_extrinsic_multi(modules, ["remove_stake"], pv, signer):
+                                return True
                     self.logger.debug("Fast path failed; falling back to SDK path.")
                     if self.no_sdk_fallback:
                         self.logger.warning("no_sdk_fallback=true: skipping SDK unstake path; will retry fast path only")
@@ -889,11 +1065,12 @@ class AutoStakeBot:
 
                 # SDK fallback (only if allowed)
                 if not self.no_sdk_fallback:
-                    self.logger.info("Submitting UNSTAKE via SDK %.8f TAO on subnet %d (attempt %d/%d)", self.stake_amount_tao, netuid, attempt, max_retries)
+                    amount_bal = bt.Balance.from_rao(amount_rao)
+                    self.logger.info("Submitting UNSTAKE via SDK %d rao on subnet %d (attempt %d/%d)", amount_rao, netuid, attempt, max_retries)
                     success = self.subtensor.unstake(
                         wallet=self.wallet,
                         hotkey_ss58=hot_ss58,
-                        amount=amount,
+                        amount=amount_bal,
                         netuid=netuid,
                         wait_for_inclusion=self.wait_for_inclusion,
                         wait_for_finalization=self.wait_for_finalization
@@ -918,6 +1095,14 @@ class AutoStakeBot:
     def analyze_block(self, block_number: int):
         """Fetch events for block_number, count stakes per subnet, trigger stake if any count >= 2."""
         try:
+            # RATE LIMIT PROTECTION: Check if enough time has passed since last operation
+            time_since_last_op = time.time() - self.last_operation_time
+            if self.last_operation_time > 0 and time_since_last_op < 30:
+                remaining = 30 - time_since_last_op
+                self.logger.debug("Skipping block %d analysis: %.1f seconds remaining in cooldown period", 
+                                block_number, remaining)
+                return
+            
             events = self._events_for_block(block_number)
             # Export raw events to JSON per block if enabled
             if self.export_events:
@@ -929,17 +1114,45 @@ class AutoStakeBot:
             if counts_removed:
                 self.logger.debug("Block %d: StakeRemoved per subnet = %s", block_number, counts_removed)
 
+            # Capture our last stake alpha for use in next-block unstake
+
+            # Count StakeAdded (trigger) and StakeRemoved (diagnostics)
+            counts_added = self._count_stake_added_by_subnet(events)
+            counts_removed = self._count_stake_removed_by_subnet(events)
+            if counts_removed:
+                self.logger.debug("Block %d: StakeRemoved per subnet = %s", block_number, counts_removed)
+
+            # Capture our last stake alpha for use in next-block unstake
+            self._update_last_alpha_from_events(events)
+
             if not counts_added:
                 self.logger.debug("Block %d: no StakeAdded events", block_number)
+                return
+
+            # Global gate: if any unstake is pending, skip all new stakes until it executes
+            if self.block_new_stakes_globally and len(self.pending_unstake_blocks) > 0:
+                self.logger.info("Pending unstake(s) present %s; skipping new stake triggers until unstake executes.",
+                                 dict(self.pending_unstake_blocks))
                 return
 
             # Determine which subnets to consider based on mode
             candidate_netuids: List[int] = []
             if self.subnet_mode == "any":
-                candidate_netuids = [n for n, c in counts_added.items() if c >= 2]
+                # Filter out subnet 0 as per requirements
+                candidate_netuids = [n for n, c in counts_added.items() if c >= 2 and n != 0]
             else:
-                if counts_added.get(self.subnet_id, 0) >= 2:
+                # Skip subnet 0 even in single mode
+                if self.subnet_id != 0 and counts_added.get(self.subnet_id, 0) >= 2:
                     candidate_netuids = [self.subnet_id]
+            
+            # RATE LIMIT PROTECTION: Limit to only 1 subnet per block
+            if candidate_netuids:
+                if len(candidate_netuids) > 1:
+                    self.logger.info("Multiple subnets triggered (%s). Limiting to 1 subnet per block to avoid rate limits.", candidate_netuids)
+                    self.logger.info("Processing subnet %d only. Remaining subnets %s will be processed in future blocks if triggers persist.", 
+                                   candidate_netuids[0], candidate_netuids[1:])
+                # Only process the first subnet
+                candidate_netuids = [candidate_netuids[0]]
 
             for netuid in candidate_netuids:
                 if not self.cfg.get("allow_overlap_triggers", False) and netuid in self.pending_unstake_blocks:
@@ -980,13 +1193,20 @@ class AutoStakeBot:
                 due.append(netuid)
 
         for netuid in due:
-            self.logger.info("Unstake due at block %d for subnet %d (scheduled: %d)", current_block, netuid, self.pending_unstake_blocks[netuid])
+            self.logger.info("Unstake due at block %d for subnet %d (scheduled: %d)", current_block, int(netuid), int(self.pending_unstake_blocks.get(netuid, -1)))
             ok = self.submit_unstake(netuid)
             if ok:
                 del self.pending_unstake_blocks[netuid]
                 if self.subnet_mode == "single":
                     self._legacy_pending_unstake_block = None
                 self._save_state()
+                
+                # RATE LIMIT PROTECTION: Wait 30 seconds after successful unstake
+                self.logger.info("Waiting 30 seconds after successful unstake to avoid rate limiting...")
+                time.sleep(30)
+                
+                # Update last operation time
+                self.last_operation_time = time.time()
             else:
                 self.logger.warning("Unstake submission failed for subnet %d; will retry on next block", netuid)
 

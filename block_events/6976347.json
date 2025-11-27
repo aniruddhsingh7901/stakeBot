@@ -1,0 +1,839 @@
+{
+  "block_number": 6976347,
+  "block_hash": "0x442aceb0a2713013186cea4b2e98aa49c3cac5a180b4ee1e3eaaf3af63e2ef24",
+  "timestamp": 1764271934,
+  "events": [
+    {
+      "module": "SubtensorModule",
+      "event": "RootClaimed",
+      "phase": "Initialization",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "coldkey"
+        }
+      ]
+    },
+    {
+      "module": "SubtensorModule",
+      "event": "RootClaimed",
+      "phase": "Initialization",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "coldkey"
+        }
+      ]
+    },
+    {
+      "module": "SubtensorModule",
+      "event": "RootClaimed",
+      "phase": "Initialization",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "coldkey"
+        }
+      ]
+    },
+    {
+      "module": "SubtensorModule",
+      "event": "RootClaimed",
+      "phase": "Initialization",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "coldkey"
+        }
+      ]
+    },
+    {
+      "module": "SubtensorModule",
+      "event": "RootClaimed",
+      "phase": "Initialization",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "coldkey"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicSuccess",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "Drand",
+      "event": "NewPulse",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "rounds"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicSuccess",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "Drand",
+      "event": "NewPulse",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "rounds"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicSuccess",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "Drand",
+      "event": "NewPulse",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "rounds"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicSuccess",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "Balances",
+      "event": "Withdraw",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "amount"
+        }
+      ]
+    },
+    {
+      "module": "Balances",
+      "event": "Deposit",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "amount"
+        }
+      ]
+    },
+    {
+      "module": "TransactionPayment",
+      "event": "TransactionFeePaid",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "actual_fee"
+        },
+        {
+          "name": "",
+          "value": "tip"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicFailed",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_error"
+        },
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "SubtensorModule",
+      "event": "TimelockedWeightsCommitted",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "5CATQqY6rA26Kkvm2abMTRtxnwyxigHZKxNJq86bUcpYsn35"
+        },
+        {
+          "name": "",
+          "value": 35
+        },
+        {
+          "name": "",
+          "value": "0x25b68c7b204ab61ff2124e24e3f9665d6de9836979bb450831c16a1675345464"
+        },
+        {
+          "name": "",
+          "value": 23824080
+        }
+      ]
+    },
+    {
+      "module": "TransactionPayment",
+      "event": "TransactionFeePaid",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "actual_fee"
+        },
+        {
+          "name": "",
+          "value": "tip"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicSuccess",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "TransactionPayment",
+      "event": "TransactionFeePaid",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "actual_fee"
+        },
+        {
+          "name": "",
+          "value": "tip"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicFailed",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_error"
+        },
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "Balances",
+      "event": "Withdraw",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "amount"
+        }
+      ]
+    },
+    {
+      "module": "Balances",
+      "event": "Deposit",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "amount"
+        }
+      ]
+    },
+    {
+      "module": "TransactionPayment",
+      "event": "TransactionFeePaid",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "actual_fee"
+        },
+        {
+          "name": "",
+          "value": "tip"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicFailed",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_error"
+        },
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "TransactionPayment",
+      "event": "TransactionFeePaid",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "actual_fee"
+        },
+        {
+          "name": "",
+          "value": "tip"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicFailed",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_error"
+        },
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "Balances",
+      "event": "Withdraw",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "amount"
+        }
+      ]
+    },
+    {
+      "module": "SubtensorModule",
+      "event": "StakeRemoved",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "5Gxf7BsF8dYwhmCv7QhJC2oTbjVWcf8wVrxp4CUJUjkUPi52"
+        },
+        {
+          "name": "",
+          "value": "5CsvRJXuR955WojnGMdok1hbhffZyB4N5ocrv82f3p5A2zVp"
+        },
+        {
+          "name": "",
+          "value": 3897185
+        },
+        {
+          "name": "",
+          "value": 90000000
+        },
+        {
+          "name": "",
+          "value": 4
+        },
+        {
+          "name": "",
+          "value": 45319
+        }
+      ]
+    },
+    {
+      "module": "Balances",
+      "event": "Deposit",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "amount"
+        }
+      ]
+    },
+    {
+      "module": "Balances",
+      "event": "Deposit",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "amount"
+        }
+      ]
+    },
+    {
+      "module": "TransactionPayment",
+      "event": "TransactionFeePaid",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "actual_fee"
+        },
+        {
+          "name": "",
+          "value": "tip"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicSuccess",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "Commitments",
+      "event": "Commitment",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "netuid"
+        },
+        {
+          "name": "",
+          "value": "who"
+        }
+      ]
+    },
+    {
+      "module": "TransactionPayment",
+      "event": "TransactionFeePaid",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "actual_fee"
+        },
+        {
+          "name": "",
+          "value": "tip"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicSuccess",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "Balances",
+      "event": "Withdraw",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "amount"
+        }
+      ]
+    },
+    {
+      "module": "SubtensorModule",
+      "event": "StakeRemoved",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "5HBUPzCAA4QutqgGFYg1odoVswkv73PvX94m3syqbtGauLJe"
+        },
+        {
+          "name": "",
+          "value": "5H8ghAf8ZGNMfd8uzW6S7JYNMuR14CjLofCibECjepJ9Vhnu"
+        },
+        {
+          "name": "",
+          "value": 41958564
+        },
+        {
+          "name": "",
+          "value": 13946375980
+        },
+        {
+          "name": "",
+          "value": 2
+        },
+        {
+          "name": "",
+          "value": 7022665
+        }
+      ]
+    },
+    {
+      "module": "Balances",
+      "event": "Deposit",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "amount"
+        }
+      ]
+    },
+    {
+      "module": "Balances",
+      "event": "Deposit",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "amount"
+        }
+      ]
+    },
+    {
+      "module": "TransactionPayment",
+      "event": "TransactionFeePaid",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "actual_fee"
+        },
+        {
+          "name": "",
+          "value": "tip"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicSuccess",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "Balances",
+      "event": "Withdraw",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "amount"
+        }
+      ]
+    },
+    {
+      "module": "Balances",
+      "event": "Deposit",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "amount"
+        }
+      ]
+    },
+    {
+      "module": "TransactionPayment",
+      "event": "TransactionFeePaid",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "actual_fee"
+        },
+        {
+          "name": "",
+          "value": "tip"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicFailed",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_error"
+        },
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "TransactionPayment",
+      "event": "TransactionFeePaid",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "actual_fee"
+        },
+        {
+          "name": "",
+          "value": "tip"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicFailed",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_error"
+        },
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    },
+    {
+      "module": "Commitments",
+      "event": "Commitment",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "netuid"
+        },
+        {
+          "name": "",
+          "value": "who"
+        }
+      ]
+    },
+    {
+      "module": "TransactionPayment",
+      "event": "TransactionFeePaid",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "who"
+        },
+        {
+          "name": "",
+          "value": "actual_fee"
+        },
+        {
+          "name": "",
+          "value": "tip"
+        }
+      ]
+    },
+    {
+      "module": "System",
+      "event": "ExtrinsicSuccess",
+      "phase": "ApplyExtrinsic",
+      "extrinsic_index": null,
+      "params": [
+        {
+          "name": "",
+          "value": "dispatch_info"
+        }
+      ]
+    }
+  ]
+}

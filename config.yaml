@@ -7,20 +7,20 @@ network: finney
 chain_endpoint: ""
 
 # Bittensor wallet identifiers
-wallet_name: default
-hotkey_name: default
+wallet_name: alec
+hotkey_name: alec-1
 # Optional: set once to avoid interactive prompt every run (stored in env during process)
-wallet_password: ""
+wallet_password: "7974773086Ani@"
 # Optional: stake to a validator's hotkey (SS58) on the target subnet. Leave empty to stake to your own hotkey.
-target_hotkey: ""
+target_hotkey: "5E2LP6EnZ54m3wS8s1yPvD5c3xo71kQroBw7aUVK32TKeZ5u"
 
 # Stake amount in TAO (floating point). Example: 0.05
-stake_amount: 0.05
+stake_amount: 0.01
 
 # Subnet targeting mode: "any" triggers on any subnet with >=2 StakeAdded in a block; "single" restricts to subnet_id
 subnet_mode: any
 # When subnet_mode: single, only this subnet id will trigger (default 63 shown as example)
-subnet_id: 63
+#subnet_id: 63
 
 # =========================
 # Performance & Behavior
@@ -29,7 +29,7 @@ subnet_id: 63
 fast_mode: true
 
 # Optional tip in TAO to improve transaction priority (0 for none). Example: 0.001
-tip_tao: 0.0
+tip_tao: 0.001
 
 # Submit without waiting for inclusion/finalization for max speed
 wait_for_inclusion: false
